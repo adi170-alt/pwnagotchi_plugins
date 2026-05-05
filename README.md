@@ -1,4 +1,4 @@
-This a new repo, previously https://github.com/adi170-alt/envtune
+This is a new repo, previously https://github.com/adi170-alt/envtune
 
 # EnvTune
 
