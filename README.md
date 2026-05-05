@@ -1,5 +1,7 @@
 This is a new repo, previously https://github.com/adi170-alt/envtune
 
+This readme is bad(generated with ai lol) and outdated becouse of the newer versions of the envtune plugin I made. The plugin keeps on getting better, stay tuned for updates.
+
 # EnvTune
 
 **Adaptive Environment Tuner for Pwnagotchi — drop-in replacement for the removed AI.**
