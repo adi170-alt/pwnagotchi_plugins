@@ -1,6 +1,7 @@
 This is a new repo, previously https://github.com/adi170-alt/envtune
 
-This readme is bad(generated with ai lol) and outdated becouse of the newer versions of the envtune plugin I made. The plugin keeps on getting better, stay tuned for updates.
+**This readme is bad(generated with ai lol) and outdated becouse of the newer versions of the envtune plugin I made. The plugin keeps on getting better, stay tuned for updates.**
+**Note that this plugin is slightly overengineered, optimizations will come in the future.**
 
 # EnvTune
 
