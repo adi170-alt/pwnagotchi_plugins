@@ -3,7 +3,7 @@
 """
 envtune.py  —  Adaptive Environment Tuner for Pwnagotchi
 =========================================================
-Version   : 1.3.0
+Version   : 1.3.5
 License   : MIT
 Repository: https://github.com/adi170-alt/envtune
 
