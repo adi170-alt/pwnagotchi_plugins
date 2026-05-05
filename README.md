@@ -1,3 +1,5 @@
+This a new repo, previously https://github.com/adi170-alt/envtune
+
 # EnvTune
 
 **Adaptive Environment Tuner for Pwnagotchi — drop-in replacement for the removed AI.**
