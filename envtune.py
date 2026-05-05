@@ -116,7 +116,6 @@ Built on top of prior art by:
   • @adi1708(⌐■_■)        — earlier envtune iterations
 """
 
-import hmac
 import html
 import json
 import logging
@@ -124,7 +123,6 @@ import math
 import os
 import queue
 import random
-import secrets
 import tempfile
 import threading
 import time
@@ -132,7 +130,10 @@ from collections import defaultdict, deque
 
 import pwnagotchi.plugins as plugins
 import pwnagotchi.utils
-from flask import make_response
+from flask import make_response, render_template_string, abort
+# Optional: pwnagotchi wraps Flask with CSRFProtect; render_template_string
+# exposes csrf_token() automatically. We don't import it directly — it's
+# resolved via the Jinja env at template-render time.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -515,6 +516,11 @@ class EnvTune(plugins.Plugin):
         self.lifetime_handshakes = 0
         self.session_start_wall  = time.time()
         self.session_start_mono  = time.monotonic()
+        # Per-session HS counter (incl. duplicates of already-captured
+        # BSSIDs). Used by /metrics for envtune_session_duplicates.
+        # Distinct from lifetime_handshakes (cross-session) and from
+        # len(_session_hs_bssids) which is the *unique* count this session.
+        self.session_handshakes  = 0
 
         # Counters synced after _load_state in on_loaded (prevents inflated
         # diff on first epoch when state has lifetime_new_count > 0).
@@ -573,10 +579,9 @@ class EnvTune(plugins.Plugin):
         self._save_thread  = None
         self._save_stop    = threading.Event()
 
-        # Web UI CSRF token — bound to the running process. POST endpoints
-        # require this token to prevent cross-site request forgery from a
-        # browser visiting an attacker page on the same LAN.
-        self._csrf_token = secrets.token_urlsafe(24)
+        # Web-UI action log (rolling, last 20). CSRF protection comes from
+        # pwnagotchi's flask_wtf.CSRFProtect middleware — we use the
+        # Flask-WTF csrf_token() helper inside our forms.
         self._action_log = deque(maxlen=20)
 
         # Plugin wiring
@@ -3344,6 +3349,7 @@ class EnvTune(plugins.Plugin):
 
             with self._state_lock:
                 self.lifetime_handshakes += 1
+                self.session_handshakes  += 1
                 # CRITICAL: distinguish lifetime-new vs. duplicate captures.
                 # _captured_bssids is loaded from /root/handshakes/ at start
                 # AND maintained across sessions via state save. So if mac_n
@@ -3595,11 +3601,11 @@ class EnvTune(plugins.Plugin):
 
             # Sub-paths for data export
             if path == 'export':
-                return self._endpoint_export()
+                return self._endpoint_export(request)
             if path == 'metrics':
                 return self._endpoint_metrics()
             if path == 'zones':
-                return self._endpoint_zones()
+                return self._endpoint_zones(request)
 
             # Main HTML dashboard — every dynamic value goes through html.escape
             # in its helper, and the whole document is returned as a raw HTML
@@ -3610,6 +3616,42 @@ class EnvTune(plugins.Plugin):
             mood = html.escape(str(self._mood))
             mobility = html.escape(str(self._current_mobility))
             base = html.escape(self._plugin_base())
+            # Build the zone alias map ONCE per render so Status and
+            # the GPS Zone table stay consistent.
+            zone_aliases, cur_zone_alias = self._build_zone_alias_map()
+
+            # Auto-refresh — only when no AP filter is active or we're
+            # on the main view. Skipped when ?norefresh=1 (operator
+            # toggle for when you're inspecting). Default 30 s — long
+            # enough not to spam, short enough to feel live.
+            refresh_secs = 30
+            try:
+                if request is not None:
+                    nr = request.args.get('norefresh', '')
+                    if nr in ('1', 'true', 'yes', 'on'):
+                        refresh_secs = 0
+                    rs = request.args.get('refresh', '')
+                    if rs and rs.isdigit():
+                        refresh_secs = max(0, min(600, int(rs)))
+            except Exception:
+                pass
+            refresh_meta = (
+                f'<meta http-equiv="refresh" content="{refresh_secs}">'
+                if refresh_secs > 0 else '')
+            # Read the optional one-shot toast message (set by post-action
+            # redirects via ?msg=…). HTML-escape because it's a query
+            # param — anyone could craft any URL.
+            toast = ''
+            try:
+                if request is not None:
+                    msg = request.args.get('msg', '') or ''
+                    ok  = (request.args.get('ok', '1') in ('1', 'true', 'yes'))
+                    if msg:
+                        cls = 'good' if ok else 'bad'
+                        toast = (f'<div class="toast {cls}">'
+                                 f'{html.escape(msg[:200])}</div>')
+            except Exception:
+                pass
 
             parts = [
                 '<!DOCTYPE html><html><head>',
@@ -3619,26 +3661,33 @@ class EnvTune(plugins.Plugin):
                 # whether the visitor's URL had a trailing slash.
                 f'<base href="{base}">',
                 '<meta name="viewport" content="width=device-width, initial-scale=1">',
+                refresh_meta,
                 f'<style>{self._ui_css()}</style></head><body>',
+                toast,
                 f'<h1>⚡ EnvTune v{version}</h1>',
                 '<p class="subtitle">',
                 f'profile=<b>{profile}</b> | gps=<b>{gps_src}</b> | ',
-                f'mood=<b>{mood}</b> | mobility=<b>{mobility}</b>',
+                f'mood=<b>{mood}</b> | mobility=<b>{mobility}</b> | ',
+                f'<a href="{base}?norefresh=1" class="muted">'
+                f'{"⏸ pause refresh" if refresh_secs > 0 else "▶ resume refresh"}</a>',
                 '</p>',
                 '<div class="links">',
                 f'<a href="{base}export">📥 Export</a> | ',
                 f'<a href="{base}metrics">📊 Metrics</a> | ',
                 f'<a href="{base}zones">🗺️ Zones</a>',
                 '</div>',
+                self._ui_summary_cards(current_zone_alias=cur_zone_alias),
                 self._ui_actions(),
-                self._ui_status(),
+                self._ui_reward_breakdown(),
+                self._ui_status(current_zone_alias=cur_zone_alias),
                 self._ui_current_params(),
+                self._ui_bandit_preview(),
                 self._ui_ucb_summary(),
                 self._ui_channels(),
-                self._ui_top_aps(),
+                self._ui_top_aps(request=request),
             ]
             if self._gps_available and self._gps_zones:
-                parts.append(self._ui_gps_zones())
+                parts.append(self._ui_gps_zones(aliases=zone_aliases))
             parts.append('</body></html>')
             return self._html_response(''.join(parts))
         except Exception as e:
@@ -3649,11 +3698,13 @@ class EnvTune(plugins.Plugin):
 
     def _ui_css(self):
         return '''
+*{box-sizing:border-box}
 body{font-family:"Courier New",monospace;background:#0d0d0d;color:#b0b0b0;
-     margin:0;padding:18px;font-size:13px}
-h1{color:#00ff88;letter-spacing:2px;margin:0 0 4px 0}
+     margin:0;padding:18px;font-size:13px;line-height:1.45}
+h1{color:#00ff88;letter-spacing:2px;margin:0 0 4px 0;font-size:1.8em}
 h2{color:#00ccff;border-bottom:1px solid #1a3a3a;padding-bottom:4px;
    margin-top:22px}
+h3{color:#00ccff;font-size:0.95em;margin:6px 0 4px 0}
 p.subtitle{color:#666;margin:0 0 10px 0}
 div.links{margin-bottom:20px}
 a{color:#00ccff;text-decoration:none}
@@ -3670,18 +3721,100 @@ tr:hover td{background:#111820}
 .warn{color:#ffaa00}
 .bad{color:#ff4444}
 .na{color:#444}
+.muted{color:#666}
 small{font-size:0.78em;color:#666}
 [title]{cursor:help;border-bottom:1px dotted #444}
 .actbar{margin:6px 0 12px 0}
 .actbtn{font-family:inherit;font-size:0.85em;padding:6px 12px;
         border:1px solid #1a3a3a;background:#101820;color:#00ccff;
-        cursor:pointer;border-radius:3px}
+        cursor:pointer;border-radius:3px;transition:all 0.15s}
 .actbtn.good{color:#00ff88;border-color:#003322}
 .actbtn.warn{color:#ffaa00;border-color:#332200}
-.actbtn:hover{background:#16242c}
+.actbtn:hover{background:#16242c;border-color:#00ccff}
+.actbtn:active{transform:translateY(1px)}
 ul.actionlog{list-style:none;padding:0;margin:6px 0 12px 0;
              font-size:0.82em;color:#888}
 ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
+
+/* SUMMARY CARDS */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+       gap:10px;margin:14px 0 22px 0}
+.card{background:linear-gradient(135deg,#0a1820 0%,#101820 100%);
+      border:1px solid #1a3a3a;border-radius:6px;padding:12px 14px;
+      position:relative;overflow:hidden}
+.card .lbl{font-size:0.78em;color:#666;text-transform:uppercase;
+           letter-spacing:1px;margin-bottom:4px}
+.card .val{font-size:1.7em;font-weight:bold;color:#00ff88;line-height:1.0}
+.card .sub{font-size:0.78em;color:#888;margin-top:3px}
+.card.warn{border-color:#332200}
+.card.warn .val{color:#ffaa00}
+.card.bad{border-color:#3a1a1a}
+.card.bad .val{color:#ff4444}
+.card.info{border-color:#1a2a3a}
+.card.info .val{color:#00ccff}
+
+/* PROGRESS / SPARKLINE */
+.bar{display:inline-block;height:8px;background:#1a1a1a;border-radius:2px;
+     overflow:hidden;vertical-align:middle;min-width:60px}
+.bar > span{display:block;height:100%;background:#00ff88}
+.bar.warn > span{background:#ffaa00}
+.bar.bad  > span{background:#ff4444}
+.bar.info > span{background:#00ccff}
+.spark{display:inline-flex;align-items:flex-end;gap:1px;height:14px;
+       vertical-align:middle}
+.spark span{display:block;width:4px;background:#00ccff;border-radius:1px 1px 0 0}
+
+/* PRIOR + UCB BADGES */
+.badge{display:inline-block;font-size:0.72em;padding:1px 5px;border-radius:3px;
+       margin-left:5px;font-weight:normal;letter-spacing:0.3px}
+.badge.prior{background:#221a00;color:#aa7700;border:1px solid #4a3300}
+.badge.cold{background:#001a22;color:#0099aa;border:1px solid #003344}
+.badge.hot{background:#002211;color:#00ff88;border:1px solid #003322}
+.badge.mood{background:#1a1a2a;color:#aaaacc}
+
+/* REWARD BREAKDOWN */
+.rwbd{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 14px 0}
+.rwbd .cmp{background:#101820;border:1px solid #1a3a3a;padding:3px 8px;
+           border-radius:3px;font-size:0.82em;display:flex;
+           align-items:center;gap:6px}
+.rwbd .cmp.pos{border-color:#003322;color:#00ff88}
+.rwbd .cmp.neg{border-color:#3a1a1a;color:#ff8888}
+.rwbd .cmp .v{font-weight:bold;font-family:inherit}
+
+/* TOAST — one-shot post-action confirmation, top-right corner */
+.toast{position:fixed;top:14px;right:14px;z-index:1000;
+       padding:10px 16px;border-radius:5px;font-size:0.9em;
+       font-weight:bold;box-shadow:0 4px 12px rgba(0,0,0,0.6);
+       animation:slidein 0.3s ease-out, fadeout 0.5s ease-in 4.5s forwards;
+       max-width:320px}
+.toast.good{background:#003322;color:#00ff88;border:1px solid #00aa55}
+.toast.bad{background:#3a1a1a;color:#ff8888;border:1px solid #cc4444}
+@keyframes slidein{from{transform:translateX(120%);opacity:0}
+                   to{transform:translateX(0);opacity:1}}
+@keyframes fadeout{to{opacity:0;transform:translateX(120%);
+                      pointer-events:none}}
+
+/* AP FILTER PANEL */
+.filterbar{margin:6px 0 10px 0;display:flex;gap:6px;flex-wrap:wrap}
+.fbtn{background:#101820;color:#888;border:1px solid #1a3a3a;
+      padding:3px 10px;border-radius:3px;font-size:0.8em;cursor:pointer;
+      font-family:inherit}
+.fbtn:hover{background:#16242c;color:#00ccff}
+.fbtn.active{background:#003322;color:#00ff88;border-color:#00ff88}
+
+/* MOBILE RESPONSIVE */
+@media (max-width:700px){
+  body{padding:10px;font-size:12px}
+  h1{font-size:1.4em;letter-spacing:1px}
+  .cards{grid-template-columns:repeat(2,1fr)}
+  .card .val{font-size:1.3em}
+  table{font-size:0.78em}
+  th,td{padding:3px 4px}
+  .actbtn{padding:5px 8px;font-size:0.78em}
+}
+@media (max-width:400px){
+  .cards{grid-template-columns:1fr}
+}
 '''
 
     @staticmethod
@@ -3693,7 +3826,202 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
         except (ValueError, TypeError):
             return html.escape(str(v))
 
-    def _ui_status(self):
+    def _ui_summary_cards(self, current_zone_alias=None):
+        """Big-KPI cards at the top of the dashboard. Each card answers
+        one question at a glance — no tables to scan."""
+        with self._state_lock:
+            uniq_lt   = self._lifetime_new_count
+            sess_uniq = len(self._session_hs_bssids)
+            sess_dup  = max(0, self.session_handshakes - sess_uniq)
+            best_rwd  = self.best_reward
+            recent    = self._last_reward_breakdown.copy() if hasattr(
+                self, '_last_reward_breakdown') else {}
+            # Compute UCB convergence percentage — fraction of cells
+            # that have at least 3 real samples (vs just the prior 0.30).
+            total = pop = 0
+            for states in self.ucb_table.values():
+                for arms in states.values():
+                    for d in arms.values():
+                        total += 1
+                        if d.get('n', 0) >= 3:
+                            pop += 1
+            convergence = (100.0 * pop / total) if total else 0.0
+            temp        = self.ema.get('temperature') or 0
+            thermal_on  = self._thermal_throttle
+            blind_left  = self._blind_recovery
+            crash_susp  = self._crash_suspect
+            mood        = self._mood
+            mobility    = self._current_mobility
+            elapsed_s   = max(1, int(time.monotonic() - self.session_start_mono))
+            hpm         = self.ema.get('hs_per_min') or 0
+            target_hpm  = self._adaptive_hpm_target() or 0
+        # Health card classification
+        if crash_susp >= 1 or thermal_on or blind_left > 0:
+            health_cls = 'bad' if crash_susp >= 2 else 'warn'
+            if thermal_on:
+                health_msg = f'thermal {temp:.0f}°C'
+            elif crash_susp >= 1:
+                health_msg = f'nexmon? ({crash_susp})'
+            else:
+                health_msg = f'blind ({blind_left} ep)'
+        elif temp >= self.cfg['temp_warn']:
+            health_cls = 'warn'
+            health_msg = f'{temp:.0f}°C'
+        else:
+            health_cls = 'good'
+            health_msg = 'all green'
+        rate_pct = min(100.0, (hpm / max(target_hpm, 0.01)) * 100.0)
+        # Recent reward (sum of breakdown if present, else best)
+        recent_r = sum(recent.values()) if recent else None
+        recent_s = (f'{recent_r:.3f}' if recent_r is not None else '—')
+
+        sess_h = elapsed_s / 3600.0
+        sess_str = (f'{int(sess_h)}h{int((sess_h%1)*60):02d}m'
+                    if sess_h >= 1 else f'{int(elapsed_s/60)}m{elapsed_s%60:02d}s')
+
+        cards_html = f'''
+        <div class="cards">
+          <div class="card">
+            <div class="lbl">🎯 Unique Lifetime</div>
+            <div class="val">{uniq_lt}</div>
+            <div class="sub">{sess_uniq} this session ({sess_dup} dup)</div>
+          </div>
+          <div class="card info">
+            <div class="lbl">⚡ Best Reward</div>
+            <div class="val">{self._fmt(best_rwd, '.3f')}</div>
+            <div class="sub">last epoch: <b>{recent_s}</b></div>
+          </div>
+          <div class="card info">
+            <div class="lbl">📡 Capture rate</div>
+            <div class="val">{hpm:.2f}<small>/min</small></div>
+            <div class="sub">target {target_hpm:.2f}
+              <div class="bar info" style="width:60%">
+                <span style="width:{rate_pct:.0f}%"></span>
+              </div>
+            </div>
+          </div>
+          <div class="card info">
+            <div class="lbl">🧠 Learning</div>
+            <div class="val">{convergence:.0f}<small>%</small></div>
+            <div class="sub">cells with ≥3 samples
+              <div class="bar info" style="width:60%">
+                <span style="width:{convergence:.0f}%"></span>
+              </div>
+            </div>
+          </div>
+          <div class="card {health_cls}">
+            <div class="lbl">🌡️ Health</div>
+            <div class="val">{html.escape(health_msg)}</div>
+            <div class="sub">{html.escape(mood)} · {html.escape(mobility)}</div>
+          </div>
+          <div class="card">
+            <div class="lbl">⏱ Session</div>
+            <div class="val">{sess_str}</div>
+            <div class="sub">{html.escape(current_zone_alias or "no GPS zone")}</div>
+          </div>
+        </div>
+        '''
+        return cards_html
+
+    def _ui_bandit_preview(self):
+        """'What would the bandit pick if it ran right now?' panel.
+
+        Shows side-by-side: the value pwnagotchi is using NOW vs the arm
+        UCB would pick at the current context. Lets you SEE the bandit
+        reasoning without waiting for the next epoch.
+        """
+        try:
+            aps_ema = self.ema.get('aps') or 0
+            state   = self._compute_state(aps_ema)
+        except Exception:
+            return ''
+        # Get current personality values for comparison
+        current_vals = {}
+        if self._agent is not None:
+            try:
+                p = self._agent._config.get('personality', {})
+                current_vals = {k: p.get(k) for k in self.UCB_ARMS}
+            except Exception:
+                pass
+
+        ret  = ('<h2>🔮 Bandit preview '
+                '<small class="muted">(what would be picked right now in '
+                f'state <b style="color:#ff0">{html.escape(state)}</b>)</small></h2>'
+                '<table>')
+        ret += ('<tr><th>Param</th><th>Current</th>'
+                '<th>Bandit pick</th><th>In sync?</th>'
+                '<th>Reason</th></tr>')
+
+        with self._state_lock:
+            for param in self.UCB_ARMS:
+                if param not in self._active_params:
+                    continue
+                self._ensure_state(param, state)
+        for param in self.UCB_ARMS:
+            if param not in self._active_params:
+                continue
+            try:
+                pick = self._ucb_select(param, state)
+            except Exception:
+                pick = None
+            current = current_vals.get(param, '?')
+            try:
+                # Compare numerically when possible
+                in_sync = (float(current) == float(pick))
+            except (TypeError, ValueError):
+                in_sync = (str(current) == str(pick))
+            sync_html = ('<span class="good">✓</span>' if in_sync
+                         else '<span class="warn">⚠ pending</span>')
+            # Reason: show the picked arm's effective mean / n
+            reason = ''
+            try:
+                tbl = self.ucb_table.get(param, {}).get(state, {})
+                d   = tbl.get(pick, {})
+                rs  = d.get('rewards', [])
+                wn  = len(rs)
+                if wn > 0:
+                    mu = sum(rs) / wn
+                    reason = f'mean {mu:.3f} over n={wn}'
+                else:
+                    reason = 'no data — exploring'
+            except Exception:
+                reason = '—'
+            ret += (f'<tr><td>{html.escape(param)}</td>'
+                    f'<td>{html.escape(str(current))}</td>'
+                    f'<td class="good"><b>{html.escape(str(pick))}</b></td>'
+                    f'<td>{sync_html}</td>'
+                    f'<td><small class="muted">{html.escape(reason)}</small></td>'
+                    f'</tr>')
+        ret += '</table>'
+        return ret
+
+    def _ui_reward_breakdown(self):
+        """Show the reward function components from the most-recent epoch.
+        Demystifies why the bandit picked what it picked."""
+        with self._state_lock:
+            bd = dict(self._last_reward_breakdown or {})
+        if not bd:
+            return ('<h2>🧪 Reward components</h2>'
+                    '<p class="muted">Waiting for first scored epoch…</p>')
+        total = sum(bd.values())
+        # Order: positive contributions desc, then negatives asc
+        pos = sorted([(k, v) for k, v in bd.items() if v > 0],
+                     key=lambda x: -x[1])
+        neg = sorted([(k, v) for k, v in bd.items() if v < 0],
+                     key=lambda x: x[1])
+        ret = ['<h2>🧪 Reward components <small>(last epoch)</small></h2>',
+               '<div class="rwbd">']
+        for k, v in pos + neg:
+            cls = 'pos' if v >= 0 else 'neg'
+            sign = '+' if v >= 0 else ''
+            ret.append(f'<div class="cmp {cls}">{html.escape(k)}'
+                       f'<span class="v">{sign}{v:.3f}</span></div>')
+        ret.append('</div>')
+        ret.append(f'<p class="muted">Σ = {total:.3f} '
+                   f'<small>(clamped to [0, 1])</small></p>')
+        return ''.join(ret)
+
+    def _ui_status(self, current_zone_alias=None):
         elapsed_h = max(0.01,
             (time.monotonic() - self.session_start_mono) / 3600.0)
         lt = int(time.time() - self.last_shake.get('time', time.time()))
@@ -3701,6 +4029,10 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
         temp = self.ema.get('temperature') or 0
         temp_cls = 'bad' if temp >= self.cfg['temp_critical'] else (
             'warn' if temp >= self.cfg['temp_warn'] else 'good')
+        # PRIVACY: never render the raw zone key (it's a reversible
+        # lat/lon grid index). Show an opaque alias instead.
+        zone_display = current_zone_alias if current_zone_alias else (
+            'in-zone (locating)' if self._current_zone else 'n/a')
 
         ret = '<h2>📊 Status</h2><table>'
         rows = [
@@ -3736,8 +4068,8 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
              'Channels with currently visible APs'),
             ('GPS source',         self._gps_source or 'none',
              'How GPS data is being read'),
-            ('Current zone',       self._current_zone or 'n/a',
-             'GPS-derived zone ID for context-specific learning'),
+            ('Current zone',       zone_display,
+             'GPS-derived zone (anonymised — raw key never shown)'),
             ('Battery',            (f'{self._battery_level:.0f}%'
                                     if self._battery_level else 'n/a'),
              'PiSugar battery level'),
@@ -3805,10 +4137,18 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
     def _ui_ucb_summary(self):
         aps_ema = self.ema.get('aps') or 0
         state   = self._compute_state(aps_ema)
+        # Annealed shrinkage k is informative for the UI: shows whether
+        # the bandit is still in cold-start mode or trusting local data.
+        try:
+            cur_k = self._current_shrinkage_k()
+        except Exception:
+            cur_k = self.cfg.get('ucb_shrinkage_k_max', 5.0)
         ret  = (f'<h2>🧠 UCB Learning — current state: '
-                f'<b style="color:#ff0">{html.escape(str(state))}</b></h2><table>')
+                f'<b style="color:#ff0">{html.escape(str(state))}</b> '
+                f'<small class="muted">shrinkage k={cur_k:.2f}</small></h2><table>')
         ret += ('<tr><th>Param</th><th>Best arm</th>'
-                '<th>Mean rwd</th><th>Window n</th>'
+                '<th>Mean rwd</th><th>n</th>'
+                '<th style="width:25%">Convergence</th>'
                 '<th>All arms (n:mean)</th></tr>')
         # Snapshot the per-state UCB tables under lock so concurrent updates
         # don't mutate dicts mid-iteration.
@@ -3833,63 +4173,171 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
             best_mean = -1.0
             best_wn   = 0
             parts     = []
+            tot_n     = 0
             for arm in arms:
                 rewards = arm_snap.get(arm, [])
                 wn      = len(rewards)
+                tot_n  += wn
                 mean    = (sum(rewards) / wn) if wn > 0 else 0.0
-                parts.append(f'{arm}({wn}:{mean:.2f})')
+                # Mark cells that are still on the seeded prior 0.30
+                # (n=1, single 0.30 sample) — UCB hasn't really learned
+                # this arm yet.
+                is_prior = (wn == 1 and abs(mean - 0.30) < 1e-6)
+                badge = ' <span class="badge prior" title="seeded prior — no real data yet">P</span>' if is_prior else ''
+                parts.append(f'{arm}({wn}:{mean:.2f}){badge}')
                 if wn > 0 and mean > best_mean:
                     best_mean, best_arm, best_wn = mean, arm, wn
-            if best_arm is not None:
+
+            # Convergence visual: progress bar of the BEST arm's local
+            # mean vs theoretical max 1.0; tinted by sample count.
+            #   < 3 samples → cold (info color)
+            #   3-9         → warming (warn)
+            #   10+         → hot (good)
+            if best_arm is not None and best_wn >= 1:
+                pct = max(0.0, min(1.0, best_mean)) * 100.0
+                if best_wn >= 10:
+                    bcls, badge = 'good', '<span class="badge hot">hot</span>'
+                elif best_wn >= 3:
+                    bcls, badge = 'warn', '<span class="badge cold">warming</span>'
+                else:
+                    bcls, badge = 'info', '<span class="badge cold">cold</span>'
+                bar_html = (f'<div class="bar {bcls}" '
+                            f'style="width:100%"><span style="width:{pct:.0f}%">'
+                            f'</span></div> {badge}')
                 ret += (f'<tr><td>{html.escape(param)}</td>'
                         f'<td class="good"><b>{html.escape(str(best_arm))}</b></td>'
                         f'<td>{best_mean:.3f}</td><td>{best_wn}</td>'
-                        f'<td><small>{html.escape(" ".join(parts))}</small></td></tr>')
+                        f'<td>{bar_html}</td>'
+                        f'<td><small>{" ".join(parts)}</small></td></tr>')
             else:
                 ret += (f'<tr><td>{html.escape(param)}</td>'
                         f'<td colspan=3 class="na">exploring…</td>'
-                        f'<td><small>{html.escape(" ".join(parts))}</small></td></tr>')
+                        f'<td><span class="badge cold">no data</span></td>'
+                        f'<td><small>{" ".join(parts)}</small></td></tr>')
         ret += '</table>'
         return ret
 
     def _ui_channels(self):
-        ret  = '<h2>📡 Channel Productivity (Lifetime)</h2><table>'
-        ret += ('<tr><th>Ch</th><th>HS</th><th>Passive HS</th>'
-                '<th>Cracked</th><th>Assocs</th><th>Deauths</th>'
-                '<th>Clients</th><th>Visits</th><th>Wasted</th>'
-                '<th>Free</th><th>Dead⚡</th><th>Score</th></tr>')
         # FIX: snapshot under lock — UI reads concurrently with event handlers.
         with self._state_lock:
             ch_lt_snap = {c: dict(v) for c, v in self._ch_lt.items()}
+            dead_lt_snap = dict(self._dead_lt)
+            dead_session_snap = dict(self._dead_session)
+            free_chs = set(self._free_channels)
         chs = sorted(ch_lt_snap.keys(),
                      key=lambda c: -ch_lt_snap[c]['hs'])[:25]
+        # Compute the global max HS so the sparkline bars are scaled
+        # against the most-productive channel rather than absolute units.
+        max_hs = max((ch_lt_snap[c].get('hs', 0) for c in chs), default=0)
+        max_hs = max(1, max_hs)
+        # Note: 'Dead' column uses _dead_session (responsive — counts
+        # epochs the channel has been absent in this session) rather
+        # than _dead_lt (which only increments after 20+ epochs of
+        # absence and looks "always 0" to short-session users).
+        ret  = ('<h2>📡 Channel Productivity '
+                '<small class="muted">(lifetime stats, sparklines = HS share)</small>'
+                '</h2><table>')
+        ret += ('<tr><th>Ch</th><th>HS</th><th>HS share</th>'
+                '<th>Passive</th><th>Cracked</th>'
+                '<th>Assocs</th><th>Deauths</th><th>Clients</th>'
+                '<th>Visits</th><th>Eff</th><th>Wasted</th>'
+                '<th>Free</th><th>Dead<small>(sess/lt)</small></th>'
+                '<th>Score</th></tr>')
         for ch in chs:
             d   = ch_lt_snap[ch]
             sc  = self._ch_score(ch)
             nol = '🔵' if ch in self.NON_OVERLAPPING else ''
-            fr  = '✨' if ch in self._free_channels else ''
+            fr  = '✨' if ch in free_chs else ''
+            hs  = d.get('hs', 0)
+            attempts = (d.get('assocs', 0) or 0) + (d.get('deauths', 0) or 0)
+            eff = (hs / attempts) if attempts else 0
+            eff_cls = ('good' if eff >= 0.10 else
+                       ('warn' if eff >= 0.03 else
+                        ('bad' if attempts >= 20 else 'muted')))
+            # Sparkline: percentage of max-channel HS, displayed as a
+            # tiny inline bar. ≥80% of max → green, ≥30% → cyan, else dim.
+            pct = 100.0 * hs / max_hs
+            spark_cls = ('good' if pct >= 80 else
+                         ('info' if pct >= 30 else 'na'))
+            spark = (f'<div class="bar" style="width:80px"><span '
+                     f'class="" style="width:{pct:.0f}%;'
+                     f'background:{"#00ff88" if spark_cls=="good" else ("#00ccff" if spark_cls=="info" else "#444")}">'
+                     f'</span></div>')
+            sess_dead = dead_session_snap.get(ch, 0)
+            lt_dead   = dead_lt_snap.get(ch, 0)
             ret += (f'<tr><td>{ch}{nol}{fr}</td>'
-                    f'<td class="good"><b>{d["hs"]}</b></td>'
+                    f'<td class="good"><b>{hs}</b></td>'
+                    f'<td>{spark}</td>'
                     f'<td>{d.get("passive_hs", 0)}</td>'
                     f'<td>{d.get("cracked", 0)}</td>'
-                    f'<td>{d["assocs"]}</td>'
-                    f'<td>{d["deauths"]}</td>'
-                    f'<td>{d["clients"]}</td>'
-                    f'<td>{d["visits"]}</td>'
-                    f'<td class="{"bad" if d["wasted"] > 10 else "warn"}">'
-                    f'{d["wasted"]}</td>'
+                    f'<td>{d.get("assocs", 0)}</td>'
+                    f'<td>{d.get("deauths", 0)}</td>'
+                    f'<td>{d.get("clients", 0)}</td>'
+                    f'<td>{d.get("visits", 0)}</td>'
+                    f'<td class="{eff_cls}">{eff*100:.1f}%</td>'
+                    f'<td class="{"bad" if d.get("wasted",0) > 10 else "warn"}">'
+                    f'{d.get("wasted", 0)}</td>'
                     f'<td>{d.get("free_seen", 0)}</td>'
-                    f'<td class="bad">{self._dead_lt.get(ch, 0)}</td>'
+                    f'<td><small>'
+                    f'<span class="{"warn" if sess_dead > 0 else "muted"}">{sess_dead}</span>'
+                    f'/<span class="bad">{lt_dead}</span>'
+                    f'</small></td>'
                     f'<td>{sc:.2f}</td></tr>')
-        ret += ('<tr><td colspan=12><small>'
-                '🔵 = non-overlapping channel · '
-                '✨ = recently reported free</small></td></tr>')
+        ret += ('<tr><td colspan=14><small>'
+                '🔵 = non-overlapping (1/6/11 on 2.4GHz) · '
+                '✨ = bettercap reported free this session · '
+                'Dead = (session epochs absent / lifetime epochs absent)'
+                '</small></td></tr>')
         ret += '</table>'
         return ret
 
-    def _ui_top_aps(self):
-        ret  = '<h2>🎯 AP Intelligence (session)</h2><table>'
-        ret += ('<tr><th>SSID</th><th>BSSID</th><th>Ch</th>'
+    def _ui_top_aps(self, request=None):
+        """AP Intelligence with filter-by-flag support via ?ap_filter=...
+
+        Filters (all optional, set via dashboard URL or ?ap_filter):
+          - all          : show everything (default)
+          - uncaptured   : only APs we haven't captured yet
+          - clients      : only APs with at least one fresh client
+          - strong       : only APs with RSSI >= -70
+          - captured     : only APs we've captured (recapture targets)
+          - pmf          : only PMF-protected APs
+        """
+        # Parse the filter once. Defaults to 'all' if not specified or
+        # if request is unavailable.
+        sel = 'all'
+        if request is not None:
+            try:
+                arg = request.args.get('ap_filter', '') or 'all'
+                if arg in ('all', 'uncaptured', 'clients',
+                           'strong', 'captured', 'pmf'):
+                    sel = arg
+            except Exception:
+                pass
+
+        # Filter buttons: link back to the dashboard with ?ap_filter=X.
+        # Using the GET param keeps the bandit/state untouched.
+        base = self._plugin_base()
+        filters = [
+            ('all',         '🌐 All'),
+            ('uncaptured',  '🆕 Uncaptured'),
+            ('clients',     '👥 With clients'),
+            ('strong',      '📶 Strong (≥-70)'),
+            ('captured',    '✓ Captured'),
+            ('pmf',         '🔒 PMF'),
+        ]
+        bar_html = '<div class="filterbar">'
+        for key, label in filters:
+            cls = 'fbtn active' if key == sel else 'fbtn'
+            bar_html += (f'<a class="{cls}" '
+                         f'href="{base}?ap_filter={key}">{label}</a>')
+        bar_html += '</div>'
+
+        # Heading shows current filter.
+        sel_label = next((l for k, l in filters if k == sel), 'All')
+        ret  = f'<h2>🎯 AP Intelligence <small class="muted">({sel_label})</small></h2>'
+        ret += bar_html
+        ret += '<table>'
+        ret += ('<tr><th>SSID</th><th>BSSID</th><th>OUI</th><th>Ch</th>'
                 '<th>RSSI</th><th>Trend</th><th>Clients</th>'
                 '<th>HS</th><th>Attacks</th><th>Eff.</th>'
                 '<th>Cooldown</th><th>Flags</th></tr>')
@@ -3899,11 +4347,41 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
         with self._state_lock:
             ap_snap = [(k, dict(v)) for k, v in self._known_aps.items()]
             ep      = self.epochs_seen
+
+        # Apply filter
+        def _keep(apID, ap):
+            captured = bool(ap.get('AT_already_captured'))
+            clients  = ap.get('AT_clients', 0) or 0
+            recency  = ep - (ap.get('AT_client_epoch', -99) or -99)
+            fresh    = clients > 0 and recency <= int(self.cfg['client_recency_epochs'])
+            try:
+                rssi = float(ap.get('rssi', -100) or -100)
+            except (TypeError, ValueError):
+                rssi = -100
+            pmf = bool(ap.get('AT_pmf_detected'))
+            if sel == 'uncaptured':
+                return not captured
+            if sel == 'clients':
+                return fresh
+            if sel == 'strong':
+                return rssi >= -70
+            if sel == 'captured':
+                return captured
+            if sel == 'pmf':
+                return pmf
+            return True
+
         sorted_aps = sorted(
-            ap_snap,
+            (x for x in ap_snap if _keep(*x)),
             key=lambda x: (-x[1].get('AT_handshake', 0),
                            -self._ap_priority_score(x[0]))
         )[:50]
+
+        if not sorted_aps:
+            ret += ('<tr><td colspan=12 class="muted" '
+                    'style="text-align:center;padding:14px">'
+                    'No APs match this filter.</td></tr>')
+
         for apID, ap in sorted_aps:
             eff     = ap.get('AT_efficiency', 0.0)
             eff_cls = ('good' if eff >= 0.1 else
@@ -3919,12 +4397,25 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
             if ap.get('AT_already_captured'): flags.append('✓Cap')
             if ap.get('AT_cracked'):          flags.append('🔓')
             host    = html.escape(str(ap.get('hostname', '?'))[:24])
-            mac     = html.escape(str(ap.get('mac', '?')))
+            mac_raw = str(ap.get('mac', '?'))
+            mac     = html.escape(mac_raw)
             chan    = html.escape(str(ap.get('channel', '?')))
             rssi    = html.escape(str(ap.get('rssi', '?')))
+            # OUI (first 3 octets) → clickable lookup. Wireshark's
+            # public OUI database is the standard reference.
+            oui_clean = mac_raw.replace(':', '').replace('-', '')[:6].upper()
+            if len(oui_clean) == 6:
+                oui_link = (
+                    f'<a href="https://www.wireshark.org/tools/oui-lookup.html'
+                    f'?oui={oui_clean}" target="_blank" rel="noopener" '
+                    f'class="muted" title="Vendor lookup (opens new tab)">'
+                    f'{oui_clean[:2]}:{oui_clean[2:4]}:{oui_clean[4:]}</a>')
+            else:
+                oui_link = '<span class="muted">—</span>'
             ret += (f'<tr>'
                     f'<td>{host}</td>'
                     f'<td><small>{mac}</small></td>'
+                    f'<td><small>{oui_link}</small></td>'
                     f'<td>{chan}</td>'
                     f'<td>{rssi}</td>'
                     f'<td>{t_str}</td>'
@@ -3938,7 +4429,41 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
         ret += '</table>'
         return ret
 
-    def _ui_gps_zones(self):
+    @staticmethod
+    def _zone_label(idx):
+        """Human-friendly opaque label: A,B,…,Z,AA,AB,…
+        Hides reversible lat/lon while keeping rows distinguishable."""
+        if idx < 26:
+            return f'Zone {chr(65 + idx)}'
+        a = (idx // 26) - 1
+        b = idx % 26
+        return f'Zone {chr(65 + a)}{chr(65 + b)}'
+
+    def _build_zone_alias_map(self):
+        """Map raw zone keys → stable aliases for THIS render.
+
+        Sort by HS desc so the most-productive zone is always 'Zone A'.
+        The mapping is rebuilt each request (no cache) — that's fine for
+        the UI, where a few-millisecond rebuild is negligible.
+
+        Returns the alias dict AND the current-zone alias string so
+        callers don't have to look it up twice.
+        """
+        with self._state_lock:
+            ranked = sorted(
+                self._gps_zones.items(),
+                key=lambda kv: -(kv[1].get('hs', 0) or 0))
+            aliases = {zk: self._zone_label(i) for i, (zk, _) in enumerate(ranked)}
+            cur     = aliases.get(self._current_zone) if self._current_zone else None
+        return aliases, cur
+
+    def _ui_gps_zones(self, aliases=None):
+        """Render the GPS Zone Productivity table with anonymised labels.
+
+        Raw lat/lon-reversible zone keys never enter the rendered HTML.
+        If you need the raw key for debugging, look at
+        `/plugins/envtune/zones?full=1` from the device itself.
+        """
         ret  = '<h2>🗺️ GPS Zone Productivity</h2><table>'
         ret += ('<tr><th>Zone</th><th>HS</th><th>Attacks</th>'
                 '<th>Visits</th><th>Top channels</th><th>Last seen</th></tr>')
@@ -3955,6 +4480,9 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                 for zk, z in self._gps_zones.items()
             ]
         zones = sorted(zones_snap, key=lambda kv: -kv[1]['hs'])[:30]
+        if aliases is None:
+            aliases = {zk: self._zone_label(i)
+                       for i, (zk, _) in enumerate(zones)}
         now = time.time()
         for zk, zd in zones:
             top = sorted(zd['channels'].items(),
@@ -3965,7 +4493,8 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                 secs = int(now - zd['last_seen'])
                 ago = (f'{secs//3600}h{(secs%3600)//60}m ago'
                        if secs > 3600 else f'{secs//60}m ago')
-            ret += (f'<tr><td><small>{html.escape(zk)}</small></td>'
+            label = aliases.get(zk, self._zone_label(0))
+            ret += (f'<tr><td>{html.escape(label)}</td>'
                     f'<td class="good"><b>{zd["hs"]}</b></td>'
                     f'<td>{zd["attacks"]}</td>'
                     f'<td>{zd["visits"]}</td>'
@@ -3976,13 +4505,80 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
 
     # ── Endpoints ─────────────────────────────────────────────────────────
 
-    def _endpoint_export(self):
-        """Full state JSON for backup or sharing as community prior."""
+    @staticmethod
+    def _anonymise_export(data):
+        """Strip location PII from a state-snapshot dict.
+
+        Replaces:
+          - gps_zones keys (raw lat_idx:lon_idx, ~150m reversible)
+            → opaque tags `zone_001`, `zone_002`, … (sorted by HS desc
+            so the order is informative).
+          - per-zone `last_seen` (unix timestamp)
+            → `days_ago` float, rounded to 0.1 day.
+        Preserves: hs / attacks / visits / channels — the parts that
+        are actually useful when shared as community priors.
+
+        Operates on a deep-ish copy so the live snapshot isn't mutated.
+        """
+        import copy
+        out = copy.deepcopy(data)
+        zones_in = out.get('gps_zones') or {}
+        if not zones_in:
+            return out
+
+        # Sort: zones with most HS first → zone_001 is the "best" zone.
+        ranked = sorted(
+            zones_in.items(),
+            key=lambda kv: -(kv[1].get('hs', 0) or 0))
+        now = time.time()
+        anon = {}
+        for idx, (_real_key, zd) in enumerate(ranked, start=1):
+            ls = _sf(zd.get('last_seen', 0)) or 0.0
+            days_ago = round(max(0.0, (now - ls) / 86400.0), 1) if ls else None
+            zd_anon = dict(zd)
+            zd_anon.pop('last_seen', None)
+            zd_anon['days_ago'] = days_ago
+            anon[f'zone_{idx:03d}'] = zd_anon
+        out['gps_zones'] = anon
+        out['_export_mode'] = 'anonymised'
+        return out
+
+    def _endpoint_export(self, request=None):
+        """State JSON for backup or community-prior sharing.
+
+        DEFAULT (`/export`): GPS zone keys are anonymised to `zone_001`,
+        `zone_002` … and per-zone `last_seen` becomes a relative
+        `days_ago` float. The reason is concrete: raw zone keys like
+        `38472:1921` are reversible to lat/lon at ~150 m precision
+        (decoded in real telemetry to a Naaldwijk address), so a user
+        innocently sharing their export would be doxxing themselves.
+        Channel histograms per zone — the actually-useful part for
+        community priors — are preserved.
+
+        FULL (`/export?full=1`): unchanged raw state, including raw zone
+        keys. Use this for your own backup; do NOT share it publicly.
+        """
         try:
             data = self._build_state_snapshot()
+
+            # Detect the optional ?full=1 escape hatch. Default = anon.
+            want_full = False
+            if request is not None:
+                try:
+                    arg = request.args.get('full', '')
+                    want_full = (arg in ('1', 'true', 'yes', 'on'))
+                except Exception:
+                    want_full = False
+
+            if not want_full:
+                data = self._anonymise_export(data)
+
             resp = make_response(json.dumps(data, indent=2, default=str), 200)
             resp.headers['Content-Type'] = 'application/json; charset=utf-8'
             resp.headers['Cache-Control'] = 'no-store'
+            # Make it explicit in the response which mode we used.
+            resp.headers['X-Envtune-Export-Mode'] = (
+                'full' if want_full else 'anonymised')
             return resp
         except Exception as e:
             resp = make_response(f'Error: {html.escape(str(e))}', 500)
@@ -3995,8 +4591,11 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
             with self._state_lock:
                 lifetime_hs   = self.lifetime_handshakes
                 lifetime_uniq = self._lifetime_new_count
-                sess_uniq     = len(self._captured_aps)
-                sess_dups     = max(0, self.session_handshakes - sess_uniq)
+                # Session counts: total handshakes captured this session
+                # (incl. duplicates) vs unique BSSIDs this session.
+                sess_total    = self.session_handshakes
+                sess_uniq     = len(self._session_hs_bssids)
+                sess_dups     = max(0, sess_total - sess_uniq)
                 pre_cap       = len(self._captured_bssids)
                 cracked       = len(self._cracked_bssids)
                 known_aps     = len(self._known_aps)
@@ -4109,11 +4708,23 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
             resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
             return resp
 
-    def _endpoint_zones(self):
-        """GPS zones JSON for external mapping tools."""
+    def _endpoint_zones(self, request=None):
+        """GPS zones JSON.
+
+        Anonymised by default (matches /export semantics). Add `?full=1`
+        for raw zone keys + timestamps. Channel histograms are always
+        included — those are the useful, non-PII bits.
+        """
         try:
+            want_full = False
+            if request is not None:
+                try:
+                    arg = request.args.get('full', '')
+                    want_full = (arg in ('1', 'true', 'yes', 'on'))
+                except Exception:
+                    want_full = False
             with self._state_lock:
-                data = {
+                raw = {
                     zk: {
                         'hs': z.get('hs', 0),
                         'attacks': z.get('attacks', 0),
@@ -4123,9 +4734,16 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                     }
                     for zk, z in self._gps_zones.items()
                 }
+            if want_full:
+                data = raw
+            else:
+                # Reuse the same anonimiser as /export for consistency.
+                data = self._anonymise_export({'gps_zones': raw})['gps_zones']
             resp = make_response(json.dumps(data, indent=2, default=str), 200)
             resp.headers['Content-Type'] = 'application/json; charset=utf-8'
             resp.headers['Cache-Control'] = 'no-store'
+            resp.headers['X-Envtune-Export-Mode'] = (
+                'full' if want_full else 'anonymised')
             return resp
         except Exception as e:
             resp = make_response(f'Error: {html.escape(str(e))}', 500)
@@ -4134,104 +4752,101 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
 
     # ── Actions panel & POST handlers ─────────────────────────────────────
 
+    # Forms use Flask-WTF's csrf_token() helper via render_template_string
+    # so pwnagotchi's CSRFProtect middleware accepts the POST. The token
+    # name is the Flask-WTF default ("csrf_token"), NOT a custom field.
+    _ACTIONS_TEMPLATE = '''
+    <h2>🛠 Actions</h2>
+    <div class="actbar">
+      {% for a in actions %}
+        <form method="POST" action="{{ base }}{{ a.path }}"
+              style="display:inline-block;margin:2px 6px 2px 0">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="actbtn {{ a.cls }}"
+                  title="{{ a.hint }}">{{ a.label }}</button>
+        </form>
+      {% endfor %}
+    </div>
+    {% if log_items %}
+      <ul class="actionlog">
+      {% for ts, name, ok, msg in log_items %}
+        <li><span class="{{ 'good' if ok else 'bad' }}">{{ ts }}</span>
+            <b>{{ name }}</b> — {{ msg }}</li>
+      {% endfor %}
+      </ul>
+    {% endif %}
+    '''
+
+    _ACTIONS = [
+        {'path': 'force-save',       'label': '💾 Force save',
+         'hint': 'Flush plugin state JSON to disk now',
+         'cls':  'good'},
+        {'path': 'rescan-potfile',   'label': '🔓 Rescan wpa-sec',
+         'hint': 'Re-read /root/handshakes/wpa-sec.cracked.potfile',
+         'cls':  'good'},
+        {'path': 'reset-stagnation', 'label': '🔄 Reset stagnation',
+         'hint': 'Clear stagnation streak & decision buffer; re-explore',
+         'cls':  'warn'},
+        {'path': 'reload-whitelist', 'label': '⛔ Reload whitelist',
+         'hint': 'Reload main.whitelist + handshake list from config',
+         'cls':  'warn'},
+        {'path': 'clear-blind',      'label': '👁 Clear blind-panic',
+         'hint': 'Drop blind-recovery counter to zero',
+         'cls':  'warn'},
+    ]
+
     def _ui_actions(self):
-        """HTML form panel for operator-driven actions. Each form posts a
-        CSRF token bound to the running process."""
-        token = html.escape(self._csrf_token)
-        # Render last 8 actions (newest first)
+        """HTML form panel for operator-driven actions. CSRF tokens come
+        from Flask-WTF's csrf_token() helper, which pwnagotchi's
+        webserver wraps via CSRFProtect — using a custom token would be
+        rejected by the middleware before reaching _handle_post."""
         with self._state_lock:
-            log_items = list(self._action_log)[-8:][::-1]
-        log_html = ''
-        if log_items:
-            log_html = '<ul class="actionlog">'
-            for ts, name, ok, msg in log_items:
-                cls = 'good' if ok else 'bad'
-                t   = time.strftime('%H:%M:%S', time.localtime(ts))
-                log_html += (f'<li><span class="{cls}">{t}</span> '
-                             f'<b>{html.escape(name)}</b> — '
-                             f'{html.escape(msg)}</li>')
-            log_html += '</ul>'
-
-        # Use the plugin's absolute mount point so the form action does
-        # NOT resolve against `/plugins/` if the user reached the page
-        # without a trailing slash (which would hit `/plugins/force-save`
-        # and 404).
-        base = html.escape(self._plugin_base())
-
-        def _form(action, label, hint, cls='warn'):
-            return (
-                f'<form method="POST" action="{base}{html.escape(action)}" '
-                f'style="display:inline-block;margin:2px 6px 2px 0">'
-                f'<input type="hidden" name="csrf" value="{token}">'
-                f'<button type="submit" class="actbtn {cls}" '
-                f'title="{html.escape(hint)}">{html.escape(label)}</button>'
-                f'</form>'
-            )
-        ret = '<h2>🛠 Actions</h2>'
-        ret += '<div class="actbar">'
-        ret += _form('force-save',
-                     '💾 Force save',
-                     'Flush plugin state JSON to disk now', 'good')
-        ret += _form('rescan-potfile',
-                     '🔓 Rescan wpa-sec',
-                     'Re-read /root/handshakes/wpa-sec.cracked.potfile',
-                     'good')
-        ret += _form('reset-stagnation',
-                     '🔄 Reset stagnation',
-                     'Clear stagnation streak & decision buffer; re-explore',
-                     'warn')
-        ret += _form('reload-whitelist',
-                     '⛔ Reload whitelist',
-                     'Reload main_whitelist & main_handshakes from config',
-                     'warn')
-        ret += _form('clear-blind',
-                     '👁 Clear blind-panic',
-                     'Drop blind-recovery counter to zero', 'warn')
-        ret += '</div>'
-        ret += log_html
-        return ret
+            log_raw = list(self._action_log)[-8:][::-1]
+        log_items = [
+            (time.strftime('%H:%M:%S', time.localtime(ts)),
+             name, ok, msg)
+            for ts, name, ok, msg in log_raw
+        ]
+        return render_template_string(
+            self._ACTIONS_TEMPLATE,
+            base=self._plugin_base(),
+            actions=self._ACTIONS,
+            log_items=log_items,
+        )
 
     def _record_action(self, name, ok, msg):
         with self._state_lock:
             self._action_log.append((time.time(), name, bool(ok), str(msg)))
 
-    def _verify_csrf(self, request):
-        try:
-            tok = ''
-            if hasattr(request, 'form'):
-                tok = request.form.get('csrf', '') or ''
-            if not tok and hasattr(request, 'values'):
-                tok = request.values.get('csrf', '') or ''
-            if not tok and hasattr(request, 'headers'):
-                tok = request.headers.get('X-CSRF-Token', '') or ''
-            return bool(tok) and hmac.compare_digest(tok, self._csrf_token)
-        except Exception:
-            return False
-
     def _post_redirect(self, action, ok, msg, status=303):
-        # Always redirect back to dashboard so the form-submission browser
-        # context stays clean (no page-reload re-POST). Action result is
-        # visible in the action log.
+        # Redirect (303 See Other) back to dashboard with a toast in the
+        # querystring. The dashboard reads ?msg=…&ok=… and renders a
+        # transient toast — no full intermediate page, no double-submit
+        # if the user reloads.
         self._record_action(action, ok, msg)
-        # Absolute path — `./` would resolve wrong if browser landed on
-        # /plugins/envtune (no trailing slash) before the POST.
         base = self._plugin_base()
-        body = (f'<!DOCTYPE html><html><head>'
-                f'<meta http-equiv="refresh" content="1; url={html.escape(base)}">'
-                f'</head><body><p>{html.escape(msg)}</p>'
-                f'<p><a href="{html.escape(base)}">→ back</a></p></body></html>')
-        resp = make_response(body, status)
-        resp.headers['Content-Type'] = 'text/html; charset=utf-8'
-        resp.headers['Location'] = base
+        # Truncate + URL-encode the toast text. The dashboard does its
+        # own html.escape on render, so we only need to make this safe
+        # for inclusion in a URL.
+        try:
+            from urllib.parse import urlencode
+            qs = urlencode({'msg': str(msg)[:200],
+                            'ok':  '1' if ok else '0'})
+        except Exception:
+            qs = ''
+        target = f'{base}?{qs}' if qs else base
+        resp = make_response('', status)
+        resp.headers['Location'] = target
         resp.headers['Cache-Control'] = 'no-store'
         return resp
 
     def _handle_post(self, path, request):
-        if not self._verify_csrf(request):
-            return self._html_response(
-                '<!DOCTYPE html><html><body><h1>403</h1>'
-                '<p>CSRF token invalid or missing.</p></body></html>',
-                status=403)
+        # CSRF: pwnagotchi wraps the webserver with flask_wtf.CSRFProtect
+        # which validates the `csrf_token` form field BEFORE this handler
+        # ever runs. If we reached here, the token was good. The previous
+        # custom `_verify_csrf` was redundant and actually broke things,
+        # because the middleware uses Flask-WTF's session-bound token,
+        # not our per-process token.
         try:
             if path == 'force-save':
                 self._enqueue_save(reason='manual')
