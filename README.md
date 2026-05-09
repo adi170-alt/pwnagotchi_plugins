@@ -12,7 +12,7 @@ Jay removed the original A2C neural network because it wrecked Wi-Fi firmware on
 - 9pm has different traffic than 3am
 - handshake yield collapses when you're walking but you don't always remember to flip a config
 
-envtune fixes that without re-introducing the firmware-killing parts. There's no neural net. There's no separate inference thread. There's nothing tweaking the radio at the channel level beyond what pwnagotchi natively does. **By default it does NOT add any radio activity to what stock noai does** ,  it only adjusts knobs pwnagotchi already supports.
+envtune fixes that without re-introducing the firmware-killing parts. There's no neural net. There's no separate inference thread. There's nothing tweaking the radio at the channel level beyond what pwnagotchi natively does. **By default it does NOT add any radio activity to what stock noai does** , it only adjusts knobs pwnagotchi already supports.
 
 It's a small multi-armed bandit (around 100 lines of actual algorithm). About 2-3% CPU on a Pi Zero 2 W. State is a single JSON file. No extra pip installs.
 
@@ -22,25 +22,120 @@ It's a small multi-armed bandit (around 100 lines of actual algorithm). About 2-
 
 **No, if:** you're on the original evilsocket fork (envtune assumes noai), you have a custom personality config you've heavily tuned and don't want second-guessed (you can set `prefer_stability=true` and the plugin will respect your config more conservatively, but it still adjusts within your range), you don't have web access to the Pi (most of the value is in the dashboard).
 
-**Maybe, if:** you wardrive ,  envtune helps when you're stationary, helps less when you're moving fast and don't stay in any one λ-distribution long enough for the bandit to converge. It still won't *hurt* you while moving (mobility is a learned context dimension), but the gains are bigger when stationary.
+**Maybe, if:** you wardrive , envtune helps when you're stationary, helps less when you're moving fast and don't stay in any one λ-distribution long enough for the bandit to converge. It still won't *hurt* you while moving (mobility is a learned context dimension), but the gains are bigger when stationary.
 
-## Install
+## Installation
 
-Drop the file in:
+### Requirements
 
-```
-/usr/local/share/pwnagotchi/custom-plugins/envtune.py
-```
+A working [jayofelony noai pwnagotchi](https://github.com/jayofelony/pwnagotchi) image (v2.9.x or newer recommended). No extra system packages, no extra `pip` installs , envtune is pure stdlib + Flask, both already in the stock image.
 
-Then in `/etc/pwnagotchi/config.toml`:
+### Option A , via plugin repository
+
+1. Add the repo to your `custom_plugin_repos` list in `/etc/pwnagotchi/config.toml`:
+
+   ```toml
+   main.confd = "/etc/pwnagotchi/conf.d/"
+   main.custom_plugin_repos = [
+       "https://github.com/jayofelony/pwnagotchi-torch-plugins/archive/master.zip",
+       "https://github.com/Sniffleupagus/pwnagotchi_plugins/archive/master.zip",
+       "https://github.com/NeonLightning/pwny/archive/master.zip",
+       "https://github.com/marbasec/UPSLite_Plugin_1_3/archive/master.zip",
+       "https://github.com/wpa-2/Pwnagotchi-Plugins/archive/master.zip",
+       "https://github.com/cyberartemio/wardriver-pwnagotchi-plugin/archive/main.zip",
+       "https://github.com/AlienMajik/pwnagotchi_plugins/archive/refs/heads/main.zip",
+       "https://github.com/adi170-alt/pwnagotchi_plugins/archive/refs/heads/main.zip"
+   ]
+   main.custom_plugins = "/usr/local/share/pwnagotchi/custom-plugins/"
+   ```
+
+2. Update the index and install:
+
+   ```bash
+   sudo pwnagotchi plugins update
+   sudo pwnagotchi plugins install envtune
+   ```
+
+### Option B , manual installation
+
+1. Clone the repo and grab the file:
+
+   ```bash
+   sudo git clone https://github.com/adi170-alt/pwnagotchi_plugins.git
+   cd pwnagotchi_plugins
+   ```
+
+2. Copy and make it executable:
+
+   ```bash
+   sudo cp envtune.py /usr/local/share/pwnagotchi/custom-plugins/
+   sudo chmod +x /usr/local/share/pwnagotchi/custom-plugins/envtune.py
+   ```
+
+### Configure the plugin
+
+Edit `/etc/pwnagotchi/config.toml`. Pick whichever TOML style your image uses.
+
+**Dotted (older images, simple installs):**
 
 ```toml
-main.plugins.envtune.enabled = true
+main.plugins.envtune.enabled          = true
+main.plugins.envtune.cpu_profile      = "balanced"   # auto-detected if omitted: minimal | light | balanced | aggressive | beast
+main.plugins.envtune.prefer_stability = true         # noai-aligned default , see "Two modes" below
+main.plugins.envtune.channel_strategy = "auto"       # auto | adaptive | full | capped
+main.plugins.envtune.log_level        = "INFO"       # DEBUG | INFO | WARNING
 ```
 
-Reboot. That's it. Defaults are already sensible ,  the plugin picks a CPU profile from `/proc/cpuinfo`, captures your `personality.channels` as the channel universe, and starts learning.
+**Bracketed format (Jayofelony image v2.9.5.4 and newer):**
 
-If you used the stock `auto-tune` plugin, disable it. envtune does the same job and more.
+```toml
+[main.plugins.envtune]
+enabled          = true
+cpu_profile      = "balanced"
+prefer_stability = true
+channel_strategy = "auto"
+log_level        = "INFO"
+```
+
+That's the minimum useful configuration. Every other knob has a sensible default , see [Common config](#common-config) for the few extras you might want.
+
+If you previously used the stock `auto-tune` plugin, disable it now. envtune replaces it:
+
+```toml
+main.plugins.auto-tune.enabled = false
+```
+
+### Restart pwnagotchi
+
+```bash
+sudo systemctl restart pwnagotchi
+```
+
+### Verify the plugin loaded
+
+Tail the log and look for the startup banner:
+
+```bash
+sudo tail -f /etc/pwnagotchi/log/pwnagotchi.log | grep envtune
+```
+
+You should see something like:
+
+```
+[envtune] auto-selected CPU profile "balanced" for detected hardware: pi_zero_2
+[envtune] v2.2.0 loaded | profile=balanced | ucb_window=40 | samples=336 ...
+[envtune] handshake dir resolved: /etc/pwnagotchi/handshakes
+[envtune] +N BSSIDs adopted from real handshake dir (total captured = N, lifetime_new = N)
+[envtune] active and learning (tuning 15 params, STABILITY mode (noai-aligned: ...))
+```
+
+Then open the dashboard:
+
+```
+http://<your-pwnagotchi-ip>:8080/plugins/envtune/
+```
+
+The first few epochs are warmup (observation only). Real learning kicks in after that.
 
 ## What you'll see
 
@@ -48,10 +143,10 @@ The dashboard is at `http://<your-pi>:8080/plugins/envtune/`.
 
 First few minutes you'll see:
 
-- **Stability mode: on (noai-aligned)** ,  the default, see below
-- **Channel universe: N channels** ,  the list of channels envtune is allowed to scan, sourced from your `personality.channels`
-- **Pre-captured BSSIDs: N** ,  handshakes already on disk; these are *not* counted as "new" when re-encountered
-- **Channel strategy: auto → adaptive (block 2/...)** ,  which scheduling strategy is currently being evaluated
+- **Stability mode: on (noai-aligned)** , the default, see below
+- **Channel universe: N channels** , the list of channels envtune is allowed to scan, sourced from your `personality.channels`
+- **Pre-captured BSSIDs: N** , handshakes already on disk; these are *not* counted as "new" when re-encountered
+- **Channel strategy: auto → adaptive (block 2/...)** , which scheduling strategy is currently being evaluated
 - **🤖 Auto-strategy meta-bandit** panel showing how the plugin is benchmarking three different strategies against each other
 
 After ~6 hours of operation, you'll see one strategy emerge as the leader for your environment. After ~150 epochs (a couple hours), you'll start to see the parameter bandit converging on values that work for your contexts.
@@ -65,11 +160,11 @@ There's exactly one switch you might want to flip. Stability mode controls wheth
 | Proactive `wifi.assoc` attacks | off | on |
 | Opportunistic channel pokes when a new client appears | off | on |
 | `full` strategy (scan all channels every epoch) when moving | banned | allowed |
-| Battery impact | minimal ,  same as stock noai | slightly higher |
+| Battery impact | minimal , same as stock noai | slightly higher |
 | Firmware stability | same as stock noai | risk increases marginally |
 | Capture rate | high | a few % higher |
 
-Default is true because the noai branch exists for stability reasons ,  sticking to that philosophy is the right default. Flip it if you have AC power, a stationary Pi, and want to squeeze out the last few percent of capture rate.
+Default is true because the noai branch exists for stability reasons , sticking to that philosophy is the right default. Flip it if you have AC power, a stationary Pi, and want to squeeze out the last few percent of capture rate.
 
 ```toml
 main.plugins.envtune.prefer_stability = false
@@ -81,11 +176,11 @@ Two bandits, layered:
 
 1. **Per-context parameter bandit.** For each of 14 personality parameters (`min_rssi`, `recon_time`, `ap_ttl`, `throttle_a`, `throttle_d`, `max_interactions`, …) it picks the value that's been working best for the current context. Context = `(AP density × time of day × mobility)` = 24 cells.
 
-2. **Strategy meta-bandit.** Every ~30 minutes, envtune runs one of three channel-scheduling strategies (`adaptive`, `full`, `capped`), measures the unique-handshake rate during that block, and uses that to decide which strategy to run next. Stationary and moving each have their own strategy bandit ,  the right answer is often different.
+2. **Strategy meta-bandit.** Every ~30 minutes, envtune runs one of three channel-scheduling strategies (`adaptive`, `full`, `capped`), measures the unique-handshake rate during that block, and uses that to decide which strategy to run next. Stationary and moving each have their own strategy bandit , the right answer is often different.
 
 Both use UCB1. The reward signal is **lifetime-new** unique BSSIDs per minute, Hill-saturated against an adaptive target (90th percentile of recent rates). Catching the same network twice doesn't move the needle.
 
-The state is persisted to `/etc/pwnagotchi/envtune_state.json` and survives reboots. The schema is versioned and migrates forward ,  older saves load cleanly.
+The state is persisted to `/etc/pwnagotchi/envtune_state.json` and survives reboots. The schema is versioned and migrates forward , older saves load cleanly.
 
 ## Sharing learning with the community
 
@@ -95,7 +190,7 @@ You can export your learned state for other people to bootstrap from:
 curl -o my_envtune_export.json http://<pi>:8080/plugins/envtune/export
 ```
 
-The default endpoint **anonymises GPS zones** (their raw keys are reversible to lat/lon at ~150m precision ,  sharing those would dox you), strips your captured BSSID list (publicly geolocatable via WiGLE), and removes the wpa-sec cracked list. It preserves the actually-useful part: which parameters and channels worked across which contexts.
+The default endpoint **anonymises GPS zones** (their raw keys are reversible to lat/lon at ~150m precision , sharing those would dox you), strips your captured BSSID list (publicly geolocatable via WiGLE), and removes the wpa-sec cracked list. It preserves the actually-useful part: which parameters and channels worked across which contexts.
 
 To use someone else's anonymised export:
 
@@ -112,7 +207,7 @@ For your own backup (don't share): `?full=1` gives you the unredacted JSON.
 ## Common config
 
 ```toml
-# Only the most useful overrides ,  defaults are good for most people.
+# Only the most useful overrides , defaults are good for most people.
 
 # Lock in one strategy if you've decided what works for you
 main.plugins.envtune.channel_strategy = "adaptive"   # or "full", "capped", "auto" (default)
@@ -138,8 +233,8 @@ Some honest things you should know:
 
 - **The plugin needs data to be useful.** First couple hours look about the same as stock noai. After that, you start to see it pick different parameters in different contexts.
 - **It can't fix bad antennas or weak signals.** No amount of parameter tuning beats a better radio location.
-- **Strategy convergence takes about 6 hours of operation.** If you reboot every 30 minutes, the strategy bandit never settles. The parameter bandit converges per-context ,  moving fast through many contexts means each one gets less data.
-- **The dashboard auto-refreshes every 30 seconds.** That's a deliberate trade-off ,  feels live, doesn't hammer the Pi. Add `?norefresh=1` to the URL when you're inspecting a value carefully.
+- **Strategy convergence takes about 6 hours of operation.** If you reboot every 30 minutes, the strategy bandit never settles. The parameter bandit converges per-context , moving fast through many contexts means each one gets less data.
+- **The dashboard auto-refreshes every 30 seconds.** That's a deliberate trade-off , feels live, doesn't hammer the Pi. Add `?norefresh=1` to the URL when you're inspecting a value carefully.
 - **By default, opportunistic channel overrides are disabled.** Even with `prefer_stability=false`, this only matters if you've also un-silenced `wifi.client.new` in your `bettercap.silence` list (which noai silences by default). The plugin will log a notice at startup if those events are unavailable.
 
 ## When something looks wrong
@@ -156,10 +251,10 @@ If `handshake dir resolved:` doesn't match your real handshake directory, someth
 
 The dashboard's **Status** panel honestly reports which optional features are active or unavailable:
 
-- "GPS source: off (mobility via AP-turnover heuristic)" ,  no GPS plugin detected, falling back
-- "Battery: not detected (no PiSugar / no UI element)" ,  battery awareness skipped
-- "Cracked (wpa-sec): not configured" ,  no potfile, the wpa-sec feedback loop is dormant
-- "Community priors: 0 file(s) in /etc/pwnagotchi/envtune_priors" ,  no community exports loaded
+- "GPS source: off (mobility via AP-turnover heuristic)" , no GPS plugin detected, falling back
+- "Battery: not detected (no PiSugar / no UI element)" , battery awareness skipped
+- "Cracked (wpa-sec): not configured" , no potfile, the wpa-sec feedback loop is dormant
+- "Community priors: 0 file(s) in /etc/pwnagotchi/envtune_priors" , no community exports loaded
 
 None of those make the plugin malfunction. They just mean specific features aren't doing anything because the prerequisites aren't there.
 
@@ -172,8 +267,8 @@ If you want a fresh start: stop pwnagotchi, delete `/etc/pwnagotchi/envtune_stat
 | `/plugins/envtune/` | Dashboard |
 | `/plugins/envtune/?ap_filter=uncaptured` | Dashboard with the AP list filtered |
 | `/plugins/envtune/?norefresh=1` | Pause auto-refresh |
-| `/plugins/envtune/export` | State JSON, anonymised ,  safe to share |
-| `/plugins/envtune/export?full=1` | State JSON, raw ,  your backup |
+| `/plugins/envtune/export` | State JSON, anonymised , safe to share |
+| `/plugins/envtune/export?full=1` | State JSON, raw , your backup |
 | `/plugins/envtune/metrics` | Prometheus metrics |
 | `/plugins/envtune/zones` | Per-zone productivity, anonymised |
 | `/plugins/envtune/force-save` (POST) | Flush state to disk now |
@@ -185,10 +280,11 @@ POST endpoints use Flask-WTF's CSRF token, the standard pwnagotchi mechanism.
 
 ## Credits
 
-- [evilsocket](https://github.com/evilsocket) ,  original pwnagotchi
-- [jayofelony](https://github.com/jayofelony) ,  noai fork
-- [Sniffleupagus](https://github.com/Sniffleupagus) ,  the `auto_tune` 
-- [AlienMajik](https://github.com/AlienMajik) ,  TheyLive GPS plugin
+- [evilsocket](https://github.com/evilsocket) , original pwnagotchi
+- [jayofelony](https://github.com/jayofelony) , noai fork
+- [Sniffleupagus](https://github.com/Sniffleupagus) , the `auto_tune` plugin envtune started life copying from
+- [AlienMajik](https://github.com/AlienMajik) , TheyLive GPS plugin
+
 
 
 
