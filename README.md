@@ -187,7 +187,7 @@ POST endpoints use Flask-WTF's CSRF token, the standard pwnagotchi mechanism.
 
 - [evilsocket](https://github.com/evilsocket) ,  original pwnagotchi
 - [jayofelony](https://github.com/jayofelony) ,  noai fork
-- [Sniffleupagus](https://github.com/Sniffleupagus) ,  the `auto_tune` plugin envtune started life copying from
+- [Sniffleupagus](https://github.com/Sniffleupagus) ,  the `auto_tune` 
 - [AlienMajik](https://github.com/AlienMajik) ,  TheyLive GPS plugin
 
 
