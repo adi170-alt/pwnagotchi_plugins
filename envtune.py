@@ -1,7 +1,499 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Envtune v1.3.5
+"""
+envtune.py  —  Adaptive Environment Tuner for Pwnagotchi
+=========================================================
+Version   : 2.2.0
+License   : MIT
+Repository: https://github.com/adi170-alt/envtune
 
+Changelog 2.1.0 → 2.2.0  (NOAI-ALIGNED: stability + battery first)
+──────────────────────────────────────────────────────────────────
+
+v2.2 audits every operation envtune performs against natural
+pwnagotchi radio behaviour, and DEFAULTS conservative wherever we'd
+add load beyond what noai does on its own.
+
+NEW DEFAULTS
+ • prefer_stability = True (DEFAULT). When True (the noai-aligned
+   default):
+     - enable_proactive is FORCED False regardless of CPU profile —
+       no extra `wifi.assoc` frames beyond what pwnagotchi's natural
+       loop fires. Operators who want max capture rate at the cost
+       of slightly more radio load can set prefer_stability=False
+       in config.toml.
+     - opportunistic_overrides defaults to False. The runtime
+       `wifi.recon.channel` poke when bettercap reports a new client
+       is silenced (bettercap's silence list disables it by default
+       anyway, so this is consistency hygiene rather than a behaviour
+       change).
+     - When mobility=moving AND prefer_stability=True, the
+       channel_strategy meta-bandit is restricted to {capped, adaptive}
+       — `full` is dropped from consideration so the Pi doesn't
+       hammer the radio with multi-channel sweeps while walking.
+       Battery saver.
+ • prefer_stability = False restores v2.1 aggressive behaviour for
+   operators who want maximum capture rate on a stationary Pi with
+   AC power.
+ • Startup log now states which mode is active so operators see the
+   trade-off at boot.
+
+DOC SWEEP
+ • Module docstring rewritten to explicitly call out the noai-aligned
+   philosophy. Plugin description updated.
+
+The bandit math, the strategy meta-bandit, the mobility-aware
+selection, and all v2.0 / v2.1 fixes are unchanged. v2.2 is purely
+about defaulting the right way.
+
+Changelog 2.0.0 → 2.1.0  (verified against noai source + original AI)
+─────────────────────────────────────────────────────────────────────
+After cross-referencing against the actual noai pwnagotchi source,
+the original removed AI module (ai/reward.py, gym.py, epoch.py), and
+the auto_tune_new.py predecessor, several fingerprint mismatches were
+found and fixed. v2.1 is the version that actually does what v2.0
+*claimed* to do.
+
+CRITICAL FIX
+ • HANDSHAKE_DIR was hardcoded to '/root/handshakes' in v1.x and v2.0.
+   The noai default is '/etc/pwnagotchi/handshakes' (per defaults.toml
+   and bettercap config). On every default install since v1.0, the
+   lifetime-new-handshake tracking found NOTHING at startup — every
+   pre-existing capture looked "new" the first time it was re-seen,
+   inflating reward and crediting the bandit for things it never did.
+   v2.1 reads the path from agent._config['bettercap']['handshakes']
+   in on_ready, with a sane fallback to the noai default. The wpa-sec
+   potfile is now resolved next to the real handshakes dir.
+
+ALGORITHMIC ADDITIONS
+ • New UCB arm: excited_num_epochs (verified in noai personality
+   defaults at value 10). The original AI tuned this; v2.0 missed it.
+ • New EMAs tracking: num_peers (mesh peers), mem_usage (Pi memory
+   pressure), slept_for_secs (epoch sleep time). All three are first-
+   class noai _epoch_data fields that v2.0 ignored. Now available for
+   future reward-function refinements and ops dashboards.
+
+OBSERVABILITY
+ • Bettercap silence-list detection at on_ready: pwnagotchi defaults
+   to silencing wifi.ap.new/lost and wifi.client.new/lost, which
+   disables our on_bcap_* handlers (opportunistic-channel override,
+   live AP/client tracking). v2.1 logs a WARNING listing the silenced
+   tags so operators understand WHY the feature is dormant — and tells
+   them how to enable it (remove tags from bettercap.silence in
+   config.toml).
+ • Handshake-count sanity check: cross-references our BSSID-extracted
+   count against pwnagotchi's pcap-file count. If they diverge >2×,
+   the operator gets a WARNING — usually means the fork uses an
+   unexpected filename convention.
+
+Changelog 1.9.0 → 2.0.0 
+─────────────────────────────────────────────
+v2.0 is the production-ready, "no-tuning-needed" release. It consolidates
+every correctness fix, hardens robustness for bare-bones setups, adds the
+observability needed to operate at scale, and ships ONE major algorithmic
+upgrade: the strategy meta-bandit is now mobility-aware.
+
+ALGORITHMIC UPGRADE
+ • Mobility-aware strategy bandit. v1.9.0 had a single 3-arm bandit
+   over (adaptive, full, capped). v2.0 has TWO 3-arm bandits — one for
+   `stationary`, one for `moving`. This matters because:
+     - When stationary: capped/adaptive consistently win (Pareto λ).
+     - When moving: full sweep is often best (entering new λ
+       distributions every block, capped lacks discovery time).
+   The bandit learns which strategy fits each mobility independently.
+   v1.9 state migrates: existing strategy stats are seeded into BOTH
+   mobility cells as warm priors so no learning is lost.
+
+CORRECTNESS FIXES (16 total)
+ F-01: warmstart_prior_reward fallback default now matches DEFAULTS (0.30).
+ F-02: warmstart docstring updated to reflect v1.7 neutral-prior semantics.
+ F-03: New PRIOR_NEUTRAL_R class constant; the magic 0.30 is no longer
+       duplicated in three places (TOD prior, warmstart-replace check,
+       UI prior badge).
+ F-04: Strategy meta-bandit reward target is now ADAPTIVE (matches the
+       param bandit's _adaptive_hpm_target). Was fixed at 0.5 unique/ep
+       — meaningless in sparse environments where no block could ever
+       earn a high reward and the bandit couldn't differentiate.
+ F-05: auto_strategy_block_secs new option (default 1800s = 30 min).
+       Replaces auto_strategy_block_epochs which was epoch-count based
+       and silently misbehaved on Pis with non-default epoch periods.
+       The epochs-based option is kept for back-compat.
+ F-06: Strategy bandit recovers gracefully on location change. The
+       block in progress is dropped (its reward would credit the wrong
+       environment); the next block starts fresh under the new
+       mobility's strategy bandit.
+ F-08: Thermal recovery now restores pre-throttle parameter values
+       instead of leaving them at the elevated values until the next
+       UCB select cycle.
+ F-09: _strategy_block_start_ep initialises to None instead of -999
+       (the latter was a dead sentinel, the cold-start branch always
+       overwrites it).
+ F-10: mood_threshold_epochs now in DEFAULTS (was hardcoded 5).
+ F-11: Documentation sweep — every "v1.5 schema" reference updated to
+       "v4 schema"; stale comments referring to deleted code removed.
+ F-12: last_shake initial state includes all fields the UI may read,
+       so first-load UI doesn't see partial dict.
+ F-13: _chistos session-stats dict is now bounded (cap 200 channels;
+       LRU eviction). Was unbounded; over months of operation could
+       accumulate stale per-channel counters.
+ F-14: proactive_min_rssi documented as deliberately decoupled from
+       the bandit's min_rssi arm (different concept: bandit chooses
+       FILTER threshold, proactive uses ATTACK threshold).
+ F-15: "Long recon cycle" warning fires only when channel_strategy is
+       explicitly "full" — not on auto-mode's periodic full sweeps,
+       which were generating false-alarm warnings.
+ F-16: import copy moved to top of file (was inline in _anonymise_export).
+
+OBSERVABILITY
+ • Prometheus /metrics endpoint now exports strategy-bandit telemetry:
+     envtune_strategy_blocks_total{strategy,mobility}
+     envtune_strategy_mean_reward{strategy,mobility}
+     envtune_strategy_current_block_uniques (current block progress)
+ • envtune_exception_count{handler} counter — lets ops dashboards
+   detect when an event handler is consistently failing.
+ • Pwnagotchi version compatibility check at on_loaded: warns if
+   running on a version outside the tested range (1.8.x noai).
+ • Cfg validation at on_loaded: every value type-checked, out-of-range
+   values logged as warnings (not silently used).
+
+ROBUSTNESS
+ • /export uses a cached state snapshot refreshed by the save thread
+   instead of building a fresh snapshot on the webhook thread (which
+   was a 50–200ms operation on Pi Zero 2 W).
+ • _chistos cap (see F-13).
+
+DOCS
+ • Comprehensive doc sweep — all version-referenced comments updated.
+ • Module docstring rewritten as the v2.0 reference.
+
+UPGRADE PATH FROM v1.9
+ No config changes required. Existing state loads cleanly. The flat
+ strategy_bandit dict in old state is automatically split into the
+ new mobility-aware structure (stationary + moving each get the v1.9
+ stats as priors). State JSON schema_version stays at 4.
+
+Changelog 1.8.1 → 1.9.0  (true AI behaviour: strategy auto-selection)
+─────────────────────────────────────────────────────────────────────
+The plugin can now auto-select its own channel scheduling strategy,
+in addition to auto-tuning its 14 personality parameters. This makes
+envtune genuinely "self-driving" — there is no longer a "right" config
+the user has to pick, the plugin learns what's right for THEIR Pi in
+THEIR environment.
+
+ • New default `channel_strategy = "auto"` — meta-bandit at the
+   strategy level. The plugin runs each strategy (adaptive/full/capped)
+   for a block of `auto_strategy_block_epochs` (default 30 ≈ 30 min),
+   measures the unique-HS-per-epoch rate, scores it via the same
+   Hill-saturated reward function the param bandit uses, and updates
+   each strategy's UCB1 stats. After the cold-start phase (each
+   strategy run once = ~90 min), pure UCB1 picks the next block:
+     score(s) = mean(s) + auto_strategy_c × sqrt(log(N_total) / n_s)
+   The leader settles within ~6 hours. Convergence accelerates if
+   the environment has clear winners, slows in marginal cases — both
+   are correct UCB behaviours.
+ • Strategy bandit state is persisted in state JSON, so learning
+   survives restarts. Schema-tolerant load (unknown strategies are
+   ignored, missing strategies stay cold-start-eligible).
+ • New web UI panel "🤖 Auto-strategy meta-bandit" shows per-strategy
+   blocks-evaluated, mean reward, recent rewards, current block
+   progress, and the leader. Operators see the AI learning live.
+ • Subtitle indicator: `channels=auto→adaptive (block 12/30)` so the
+   active strategy + block progress are visible at a glance.
+ • Block-end log line: `auto-strategy block done: adaptive →
+   X unique HS in 30 ep (reward=Y). Next block: full` — operators
+   can correlate HS bursts with strategy choices in the system log.
+
+If you prefer to lock in one strategy (e.g. you've verified your
+environment and want pure exploitation), set explicitly in config.toml:
+  main.plugins.envtune.channel_strategy = "adaptive"   # or full / capped
+
+Changelog 1.8.0 → 1.8.1  (robustness for bare-bones setups)
+───────────────────────────────────────────────────────────
+EnvTune is designed to work fully even when optional features are
+absent. v1.8.1 cleans up several places where the code wasn't quite
+honouring that promise.
+
+ • cracked_bssids: state-load now MERGES with the live potfile instead
+   of REPLACING. The comment in _load_state explicitly said "safety net
+   rather than the source of truth", but on_loaded was overwriting.
+   Cases this fixes:
+     - User used wpa-sec briefly, then disabled it: state had cracks,
+       now they survive.
+     - Potfile got rotated/truncated: cracks remembered.
+     - Pi without wpa-sec at all: still works (set just stays empty).
+   Same fix applied to the periodic rescan in on_epoch and the
+   "Rescan potfile" web action.
+ • Anonymised export now strips captured_bssids and cracked_bssids.
+   These are publicly geolocatable via WiGLE (https://wigle.net) and
+   sharing them effectively reveals approximate locations the operator
+   has been. Counts are preserved so the receiver knows roughly how
+   seasoned the contributing operator is.
+ • Anonymised export also redacts ema.speed (GPS-derived mobility
+   signal).
+ • Community-priors merge ONLY reads ucb_table — defensive against an
+   operator accidentally dropping a non-anon export into the priors
+   directory. captured_bssids / cracked_bssids / gps_zones / EMA from
+   community files are now ignored.
+ • Status panel now shows feature availability honestly:
+     - "GPS source: off (mobility via AP-turnover heuristic)"
+     - "Battery: not detected (no PiSugar / no UI element)"
+     - "Cracked (wpa-sec): not configured" when no potfile exists
+     - "Channel universe: 11 channels (2.4 GHz)" / "(2.4 + 5 GHz)"
+     - "Community priors: 0 file(s) in /etc/pwnagotchi/envtune_priors"
+       with hint to drop anon exports there
+     - "Channel strategy: adaptive/full/capped"
+   So operators of bare-bones setups understand at a glance what's
+   active vs unavailable, and never wonder if "0" means broken.
+
+Changelog 1.7.1 → 1.8.0
+───────────────────────
+ • New `channel_strategy` config option with three modes:
+     - "adaptive" (DEFAULT, recommended): top-K productive channels
+       most epochs (best HS yield) + full universe sweep every
+       channel_full_sweep_every (default 15) epochs (~15 min) so the
+       bandit re-checks channels that scored low historically.
+     - "full":  legacy v1.7.1 behaviour — every channel every epoch.
+     - "capped": legacy v1.5–v1.7.0 — top-K only, no sweeps.
+ • The adaptive default is the math-optimal trade-off: in a Pareto
+   λ_total distribution (the typical Wi-Fi environment), capped mode
+   yields ~32% more handshakes per epoch than full mode because each
+   channel gets more time. Adaptive sacrifices ~3% yield to get full
+   coverage every 15 epochs — discovering new productive channels
+   without paying the per-epoch coverage tax.
+ • The legacy `respect_full_channels` flag is now a back-compat alias:
+   True → "full", False → "capped". Unset (== None default in the new
+   DEFAULTS) → falls through to channel_strategy="adaptive".
+ • UI subtitle shows current strategy + countdown to next adaptive
+   sweep. Hover for explanation.
+ • Adaptive sweep is logged at INFO level when it fires, so operators
+   can correlate handshake bursts with sweep epochs.
+
+Changelog 1.7.0 → 1.7.1
+───────────────────────
+ • respect_full_channels (default True): the user's `personality.channels`
+   from config.toml is now the channel universe. The bandit re-orders
+   channels by score so the most-productive lead the hop cycle, but
+   NEVER returns a smaller list than the user configured. v1.5–v1.7.0
+   silently truncated long user-configured lists down to 14 channels
+   (the recon-cycle cap). The cap is now legacy-only; set
+   respect_full_channels=false in config.toml to restore it.
+ • Empty `personality.channels` (= "scan all" in pwnagotchi semantics)
+   now expands to the iface's full hardware-supported list, including
+   5 GHz channels 36–165, instead of being clamped to 1–11.
+ • Opportunistic-channel-override (when bettercap reports a new client)
+   no longer pushes channels OUTSIDE the user's universe.
+ • Long-recon-cycle warning logged once every 50 epochs when the user's
+   universe makes the hop cycle exceed 120 s, so operators see the
+   trade-off they're choosing.
+
+Changelog 1.6.0 → 1.7.0  (driven by analysis of community v1.3 exports)
+───────────────────────────────────────────────────────────────────────
+Algorithmic
+ • warmstart_prior_reward default lowered 0.45 → 0.30 (neutral). Real
+   community telemetry showed that the 0.45 bias toward the user's
+   existing pwnagotchi defaults locked the bandit onto suboptimal arms
+   for thousands of epochs (e.g. ap_ttl=120 accumulating 3944 samples
+   at mean reward 0.064 — the worst arm — while the truly-best arm
+   ap_ttl=60 only got 211). At 0.30 the synthetic sample still satisfies
+   UCB's "every arm tried once" property without actively misleading
+   selection.
+ • Forced-exploration floor: every `forced_explore_every` epochs, if
+   the current state has any arm with n < 5 across the active params,
+   the bandit overrides UCB and picks the most-starved arm instead.
+   Closes the v1.5/v1.6 starvation pattern where arms like
+   `min_recon_time=4` (n=35, mean=0.212 — the BEST observed) never got
+   enough samples to escape their wide UCB bounds.
+ • Location change no longer neutral-credits buffered decisions with
+   reward 0.5. Real telemetry showed those neutral credits drift state
+   means toward 0.5, hiding both genuinely-bad and genuinely-good arms.
+   Buffered decisions are now dropped entirely on location change —
+   the new environment gets a clean exploration phase via the existing
+   exploration_boost mechanism.
+ • Channel-efficiency multiplier strengthened. Was `0.5 + eff*3.0`
+   capped 0.5–1.5×; community channel data showed channel 7 with 16.5%
+   HS/attack getting essentially 1.0× boost while losing to channel 1
+   (8% efficiency, 10× more raw HS) on absolute-score grounds. Now
+   `0.5 + eff*5.0` capped 0.4–2.5× — a 16% channel gets 1.32×, a 20%
+   channel gets 1.5×.
+
+Robustness
+ • EMA denormal floor: any [0,1]-clamped EMA below 1e-6 snaps to 0.
+   Telemetry from real users showed `hs_rate=2.4e-15`,
+   `missed_rate=2.3e-28` — mathematically valid exponential decay but
+   meaningless to the bandit, and dangerous because the next non-zero
+   sample creates an enormous EMA jump that the reward function
+   misattributes to whichever arm was chosen.
+ • Schema migration v3 → v4 verified end-to-end against four real
+   community exports (108-state schema → 24-state schema, all 432
+   migrated states have valid 3-component keys, mobility correctly
+   collapsed walking+mobile → moving).
+
+UI / community
+ • Starved-arm warning column in the UCB Learning panel — flags arms
+   with mean > 0.30 but n < 5 so operators can see what the bandit is
+   missing.
+ • New `POST /import-priors` endpoint accepts a community export JSON
+   and merges its UCB samples into the local table at low weight (each
+   imported reward weighted as 0.4× a real local observation). This
+   lets new users bootstrap from collective wisdom instead of running
+   ~200 epochs of cold-start.
+
+Changelog 1.5.0 → 1.6.0
+───────────────────────
+Correctness
+ • Hierarchical prior restored — schema-3 length check (was len==4 left
+   over from the v1.4 → v1.5 schema collapse, leaving the empirical-Bayes
+   shrinkage falling back to flat population mean across all 24 states).
+   Neighbour states now actually contribute extra weight again.
+ • `reset_history` default now agrees in DEFAULTS and at the call site
+   (was True at the .get() fallback, False in DEFAULTS — destructive if
+   the key ever went missing).
+ • `stagnation_boost_epochs` added to DEFAULTS — was referenced by the
+   reset-stagnation web action but never actually overridable.
+ • PMF re-evaluation now clears the detection timestamp too, so a second
+   detection isn't compared against a stale age.
+ • Named module logger ('envtune') instead of mutating the ROOT logger
+   level — debug logs no longer flood every other Pwnagotchi component.
+ • `_decision_buffer` maxlen now scales with reward_delay, so users with
+   sparse-environment configs no longer silently lose attribution.
+ • `_save_worker` drain loop preserves the latest snapshot even when a
+   shutdown sentinel arrives mid-coalesce.
+
+Performance
+ • `_ch_score` memoised per-epoch — was O(channels² · known_aps) per
+   epoch, now O(channels · known_aps) once; ~5–10× faster scheduling
+   on dense environments.
+ • Total-samples counter for shrinkage anneal — `_current_shrinkage_k`
+   no longer walks the entire UCB table (~9k cells) every selection.
+
+Concurrency
+ • `_unscanned_channels`, `_active_channels`, `_dead_session` now read
+   under `_state_lock` consistently — were mutated under lock in
+   on_wifi_update but read lockless in `_schedule_channels`.
+
+Algorithmic
+ • RSSI weighting in `_ap_priority_score` is now geometric (RSSI is
+   logarithmic in dB — strong signals succeed disproportionately).
+ • `_recent_hpm` and `_reward_history` persisted across restarts so the
+   adaptive HPM target doesn't degrade to the floor for ~10 epochs on
+   every reload.
+
+Hygiene
+ • Dead code removed: legacy `_sw_ucb_pick` (replaced by with_state
+   variant), `_hierarchical_marginal` (subsumed by shrinkage),
+   `abort` import, `session_start_wall` (unused), `cracked` channel
+   counter (was never written, only read).
+
+
+A drop-in replacement for the removed pwnagotchi AI, built specifically
+for jayofelony/pwnagotchi (noai branch). Uses Sliding-Window UCB1 — a
+proven reinforcement learning technique — with a contextual state space
+extended by GPS zones, thermal safety, client awareness, and smart
+channel scheduling. Gets measurably better every session.
+
+Why this exists
+───────────────
+Jay removed the A2C neural network because it destabilised the wifi
+firmware and drained batteries. The stock pwnagotchi is still strong,
+but runs on fixed parameters — it can't adapt to your specific routes,
+times, or environments. EnvTune fills that gap using lightweight ML
+(≈ 2-3% CPU on a Pi Zero 2 W) that cannot crash the radio.
+
+What it learns per environmental context
+─────────────────────────────────────────
+14 personality parameters across 24 contexts (density × time × mobility).
+UCB1 with a sliding window means the learning adapts as environments
+change — a stale memory of "what worked in 2024" does not override
+fresh evidence of "what works here now".
+
+Key capabilities
+────────────────
+ • 14-parameter UCB learning (ALL verified against jayofelony defaults)
+ • Hierarchical priors so rare contexts benefit from common ones
+ • Proper bettercap sync for wifi.ap.ttl / sta.ttl / min.rssi
+ • GPS zone-aware learning (optional, auto-detects TheyLive/stock gps)
+ • Stationary vs mobile detection via speed/AP-turnover
+ • Heatmap of captures with zone productivity scoring
+ • Thermal safety (Pi can crash >80°C — we back off at 70°C)
+ • Client-aware targeting (deauth needs clients; PMKID doesn't)
+ • PMF detection (stops wasting deauths on protected networks)
+ • Per-AP cooldown on persistent non-responders
+ • Already-captured detection from /root/handshakes/
+ • Free-channel opportunism via on_free_channel callback
+ • PiSugar battery awareness (optional, graceful)
+ • wpa-sec cracked-feedback loop (if potfile exists)
+ • Whitelist respect (doesn't skew learning on skipped APs)
+ • Nexmon crash detection + automatic backoff
+ • Async state save (no SD-card IO stalls mid-epoch)
+ • Version-migrated state (survives plugin upgrades)
+ • Full web UI at /plugins/envtune/ with explanatory tooltips
+ • Five CPU profiles: minimal, light, balanced, aggressive, beast
+
+Requirements
+────────────
+ • jayofelony/pwnagotchi (noai branch)     — verified compatible
+ • Python 3.7+                             — part of stock image
+ • No extra pip packages                   — uses only stdlib + flask
+
+Installation
+────────────
+ 1) Copy this file to /usr/local/share/pwnagotchi/custom-plugins/envtune.py
+ 2) In /etc/pwnagotchi/config.toml add:
+
+        main.plugins.envtune.enabled = true
+
+ 3) (Optional) pick a CPU profile for your hardware:
+
+        main.plugins.envtune.cpu_profile = "balanced"
+        # choices: "minimal" "light" "balanced" "aggressive" "beast"
+        # default: auto-detects based on /proc/cpuinfo
+
+ 4) (Optional) GPS integration — works automatically if TheyLive or
+    stock gps plugin is enabled. No config required.
+
+ 5) (Optional) PiSugar — automatically detected if pisugarx is enabled.
+
+ 6) (Optional) Turn off stock auto_tune if you use it — envtune replaces
+    it completely.
+
+ 7) Reboot. First 20 epochs = warmup + exploration. After ~200 epochs
+    the plugin begins consistently choosing optimal parameters for each
+    state you encounter. It gets smarter forever.
+
+Config presets (add to config.toml to override defaults)
+─────────────────────────────────────────────────────────
+For aggressive wardriving:
+    main.plugins.envtune.cpu_profile = "aggressive"
+    main.plugins.envtune.temp_critical = 80.0
+    main.plugins.envtune.extra_channels = 5
+
+For stealthy home use:
+    main.plugins.envtune.cpu_profile = "light"
+    main.plugins.envtune.ucb_c = 1.0
+    main.plugins.envtune.opportunistic_overrides = false
+
+For max learning on strong hardware (Pi 4/5):
+    main.plugins.envtune.cpu_profile = "beast"
+    main.plugins.envtune.ucb_window = 80
+    main.plugins.envtune.save_every_n_epochs = 10
+
+Web UI
+──────
+http://<pwnagotchi>:8080/plugins/envtune/
+Shows live stats, UCB learning table, channel productivity, AP
+intelligence, GPS zones, and thermal status. Hover any value for an
+explanation.
+
+Credits
+───────
+Built on top of prior art by:
+  • @evilsocket   — original pwnagotchi
+  • @jayofelony   — noai fork
+  • @Sniffleupagus — auto_tune plugin
+  • @AlienMajik — TheyLive GPS plugin
+"""
+
+import copy
 import html
 import json
 import logging
@@ -16,10 +508,16 @@ from collections import defaultdict, deque
 
 import pwnagotchi.plugins as plugins
 import pwnagotchi.utils
-from flask import make_response, render_template_string, abort
+from flask import make_response, render_template_string
 # Optional: pwnagotchi wraps Flask with CSRFProtect; render_template_string
 # exposes csrf_token() automatically. We don't import it directly — it's
 # resolved via the Jinja env at template-render time.
+
+# Module-level logger. Using the named logger ('envtune') instead of the
+# root logger means setting log_level here does NOT flood every other
+# Pwnagotchi component (bettercap-bridge, mesh, other plugins) with
+# debug output. v1.6 fix.
+log = logging.getLogger('envtune')
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -77,22 +575,62 @@ def _detect_hardware():
     """
     Detect Pi hardware for CPU profile defaults.
     Returns one of: 'pi_zero', 'pi_zero_2', 'pi_3', 'pi_4', 'pi_5', 'unknown'
+
+    Detection priority (FIX in v1.4.1):
+      1. The model string from `/proc/cpuinfo`'s "Model" line — the
+         most specific and reliable signal. e.g. "Raspberry Pi 3 Model
+         B Rev 1.2" or "Raspberry Pi Zero 2 W Rev 1.0".
+      2. SoC chip codes — bcm2710 (Pi 0 2W), bcm2837 (Pi 3), bcm2711
+         (Pi 4), bcm2712 (Pi 5).
+      3. CPU core (cortex-a53 etc.) is intentionally NOT used as a
+         primary signal: both Pi 0 2W and Pi 3 use Cortex-A53, so
+         matching on it would cause Pi 3 to be misclassified as Pi 0
+         2W (and pick the wrong CPU profile).
+
+    Also reads `/proc/device-tree/model` as a fallback — that file
+    contains exactly "Raspberry Pi 3 Model B Plus Rev 1.3" etc. on
+    modern kernels and is more deterministic than cpuinfo.
     """
+    info = ''
     try:
-        with open('/proc/cpuinfo') as f:
-            info = f.read().lower()
-        if 'pi zero 2' in info or 'bcm2710' in info or 'cortex-a53' in info:
-            return 'pi_zero_2'
-        if 'pi zero' in info or 'bcm2835' in info:
-            return 'pi_zero'
-        if 'bcm2837' in info or 'pi 3' in info:
-            return 'pi_3'
-        if 'bcm2711' in info or 'pi 4' in info:
-            return 'pi_4'
-        if 'bcm2712' in info or 'pi 5' in info:
-            return 'pi_5'
+        with open('/proc/device-tree/model') as f:
+            info += f.read().lower() + '\n'
     except Exception:
         pass
+    try:
+        with open('/proc/cpuinfo') as f:
+            info += f.read().lower()
+    except Exception:
+        pass
+
+    if not info:
+        return 'unknown'
+
+    # Most-specific model strings first. The order matters: 'pi zero 2'
+    # is checked before 'pi zero' so the 2W isn't matched by both.
+    if 'raspberry pi zero 2' in info or 'pi zero 2' in info:
+        return 'pi_zero_2'
+    if 'raspberry pi 5' in info or 'pi 5' in info:
+        return 'pi_5'
+    if 'raspberry pi 4' in info or 'pi 4' in info:
+        return 'pi_4'
+    if 'raspberry pi 3' in info or 'pi 3' in info:
+        return 'pi_3'
+    if 'raspberry pi zero' in info or 'pi zero' in info:
+        return 'pi_zero'
+
+    # SoC fallback. Each chip is unique to one Pi model so this is safe.
+    if 'bcm2712' in info:
+        return 'pi_5'
+    if 'bcm2711' in info:
+        return 'pi_4'
+    if 'bcm2710' in info:
+        return 'pi_zero_2'
+    if 'bcm2837' in info:
+        return 'pi_3'
+    if 'bcm2835' in info:
+        return 'pi_zero'
+
     return 'unknown'
 
 
@@ -150,7 +688,7 @@ HW_DEFAULT_PROFILE = {
 
 class EnvTune(plugins.Plugin):
     __author__      = 'adi1708'
-    __version__     = '1.3.0'
+    __version__     = '2.2.0'
     __license__     = 'MIT'
     __description__ = ('Adaptive environment tuner — drop-in replacement '
                        'for the removed pwnagotchi AI. Learns optimal '
@@ -160,12 +698,45 @@ class EnvTune(plugins.Plugin):
 
     # ── Paths ─────────────────────────────────────────────────────────────
     STATE_PATH    = '/etc/pwnagotchi/envtune_state.json'
-    HANDSHAKE_DIR = '/root/handshakes'
     GPS_TRACK     = '/root/pwnagotchi_gps_track.ndjson'   # TheyLive
-    WPASEC_POT    = '/root/handshakes/wpa-sec.cracked.potfile'
+    # v2.1.0: HANDSHAKE_DIR is now a FALLBACK only. The real path comes
+    # from agent._config['bettercap']['handshakes'] which the noai
+    # default sets to '/etc/pwnagotchi/handshakes' — NOT /root/handshakes
+    # as v1.x and v2.0 hardcoded. That meant lifetime-new-handshake
+    # tracking was silently empty on every noai install since v1.0.
+    # The actual path is captured in on_ready into self._hs_dir.
+    HANDSHAKE_DIR_FALLBACK = '/etc/pwnagotchi/handshakes'
+    # Likewise, the wpa-sec potfile lives next to the handshakes dir
+    # (configurable via wpa-sec plugin's path setting). We resolve it
+    # in on_ready from the live handshakes dir.
+    WPASEC_POT_FALLBACK    = '/etc/pwnagotchi/handshakes/wpa-sec.cracked.potfile'
+    # v1.7: community-priors directory. Drop anonymised export.json
+    # files here (anything ending .json) and the plugin will merge
+    # their UCB samples into the local table at low weight on startup.
+    # Lets new users bootstrap from collective wisdom instead of
+    # running ~200 epochs of cold-start. Files are scanned once at
+    # `on_loaded`; rename or move them to disable.
+    COMMUNITY_PRIORS_DIR = '/etc/pwnagotchi/envtune_priors'
 
-    # State schema — bumped on breaking changes, migrate on load
-    STATE_SCHEMA_VERSION = 3
+    # State schema — bumped on breaking changes, migrate on load.
+    #   v1, v2: density_tod_trend (3 dims, no mobility)
+    #   v3:     density_tod_trend_mobility (4 dims, 108 states)
+    #   v4:     density_tod_mobility (3 dims, 24 states; trend dropped,
+    #           walking+mobile collapsed into 'moving'). v2.0 still v4 —
+    #           the strategy_bandit shape change is migrated in-place,
+    #           no schema bump needed for the param-bandit table.
+    STATE_SCHEMA_VERSION = 4
+
+    # v2.0: single source of truth for the cold-start neutral prior R.
+    # Used in three places (TOD prior, warmstart-replace check, UI prior
+    # badge). Must stay in sync with `warmstart_prior_reward` default —
+    # they're conceptually the same number (the "no information" reward
+    # level the bandit treats as equivalent to no data).
+    PRIOR_NEUTRAL_R = 0.30
+
+    # Pwnagotchi version compatibility — warn if outside this range so
+    # operators know the plugin hasn't been verified on their fork.
+    PWNAGOTCHI_VERIFIED_VERSIONS = ('1.8.', '1.9.', '2.')
 
     # ── UCB arms — VERIFIED against jayofelony defaults.toml (noai) ───────
     # Every single parameter here actually exists and affects pwnagotchi
@@ -195,6 +766,8 @@ class EnvTune(plugins.Plugin):
         # These influence its decision to take a break / change mode and
         # therefore indirectly affect handshake productivity. The original
         # AI tuned these too — they are safe to learn (no firmware impact).
+        # v2.1.0: added excited_num_epochs (verified in noai defaults.toml).
+        'excited_num_epochs':        [5, 10, 15, 20],
         'bored_num_epochs':          [10, 15, 20, 25],
         'sad_num_epochs':            [15, 20, 25, 30],
     }
@@ -213,6 +786,7 @@ class EnvTune(plugins.Plugin):
         'recon_inactive_multiplier': (1,      3),
         'throttle_a':                (0.2,  1.0),
         'throttle_d':                (0.3,  1.2),
+        'excited_num_epochs':        (5,     20),
         'bored_num_epochs':          (10,    30),
         'sad_num_epochs':            (15,    30),
     }
@@ -229,10 +803,16 @@ class EnvTune(plugins.Plugin):
     # Non-overlapping channels get a scoring bonus (less interference)
     NON_OVERLAPPING = {1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161}
 
-    # Mobility categories based on speed (m/s)
+    # Mobility categories — v1.5 collapsed from 3-way to 2-way to
+    # 4.5× the sample efficiency. Real-world data showed walking and
+    # mobile produced near-identical optimal params (short ap_ttl,
+    # shorter recon_time); only stationary was meaningfully different.
     MOBILITY_STATIONARY = 'stationary'  # < 0.5 m/s (≈ 1.8 km/h)
-    MOBILITY_WALKING    = 'walking'     # 0.5 – 3.0 m/s (walk/jog)
-    MOBILITY_MOBILE     = 'mobile'      # > 3.0 m/s (bike/car)
+    MOBILITY_MOVING     = 'moving'      # ≥ 0.5 m/s (walking, biking, driving)
+    # Legacy values — kept as constants for state migration. Code never
+    # produces these any more, but old state files use them.
+    MOBILITY_WALKING    = 'walking'
+    MOBILITY_MOBILE     = 'mobile'
 
     # ── Default config (all overridable via main.plugins.envtune.*) ───────
     DEFAULTS = {
@@ -265,10 +845,45 @@ class EnvTune(plugins.Plugin):
         # explicitly we keep using that as a fixed override (no anneal).
         'ucb_shrinkage_k':           None,
 
+        # WARM-START strength. Whatever pwnagotchi's `personality.*`
+        # values are at startup, the closest UCB arm in every state
+        # gets seeded with a synthetic reward at this level.
+        #
+        # v1.7: lowered 0.45 → 0.30 (== neutral TOD prior). Real
+        # community telemetry showed the 0.45 bias was sticky enough
+        # to lock the bandit onto suboptimal user-defaults for
+        # thousands of epochs (e.g. ap_ttl=120 accumulated 3944 samples
+        # at mean reward 0.064 — the WORST arm — while ap_ttl=60, the
+        # truly-best, only got 211). At 0.30 the synthetic sample still
+        # satisfies UCB's "every arm tried once" property and seeds
+        # the n=1 bucket so the bandit doesn't burn a real epoch on
+        # cold-start trial — but it stops actively recommending the
+        # user's default config when evidence says otherwise.
+        # Set to >0.30 to re-enable the old "trust user settings" mode.
+        'warmstart_prior_reward':    0.30,
+
         # Stagnation / exploration
         'stagnation_epochs':         12,
         'exploration_boost_c':       2.5,
         'exploration_boost_epochs':  6,
+        # v1.7 forced-exploration floor. Every `forced_explore_every`
+        # epochs, override UCB to pick the most-starved arm in the
+        # current state for one randomly-chosen active param. Closes
+        # the v1.5/v1.6 starvation pattern where promising arms with
+        # n<5 never accumulate enough samples to escape their wide
+        # UCB bound. Set to 0 to disable; default 8 epochs strikes
+        # a balance (≈ 12% of decisions are forced explorations).
+        # `forced_explore_starvation_n` is the n threshold below which
+        # an arm counts as "starved."
+        'forced_explore_every':           8,
+        'forced_explore_starvation_n':    5,
+        # Boost length when operator manually clicks "Reset stagnation"
+        # in the web UI. Larger than the auto-detected boost because a
+        # human-driven reset means the operator KNOWS something has
+        # changed and we should explore aggressively. Was previously
+        # read from cfg with a hardcoded fallback of 30 — now declared
+        # so the option is actually honoured if set in config.toml.
+        'stagnation_boost_epochs':   30,
 
         # Blind panic
         'blind_panic_epochs':        3,
@@ -311,25 +926,98 @@ class EnvTune(plugins.Plugin):
         'priority_channel_weight':   0.70,
         'dead_channel_cooldown':     5,
         'dead_ch_lifetime_weight':   0.01,
+        # v1.9.0 channel_strategy:
+        #   "auto" (DEFAULT, recommended): runs a meta-bandit at the
+        #     strategy level. Each block of `auto_strategy_block_epochs`
+        #     (default 30 ≈ 30 min), the plugin chooses one strategy
+        #     (adaptive / full / capped) via UCB1 over their observed
+        #     unique-HS-per-epoch rates, runs that strategy for the
+        #     whole block, scores the result, and updates the strategy
+        #     bandit. Within ~6 hours of operation the plugin auto-
+        #     converges on whatever strategy genuinely works best in
+        #     YOUR specific environment. No tuning needed.
+        #   "adaptive" (the v1.8.0 default): top-K productive channels
+        #     most epochs + full universe sweep every
+        #     channel_full_sweep_every epochs.
+        #   "full":   scan whole universe every epoch.
+        #   "capped": legacy top-K only, no sweeps.
+        'channel_strategy':          'auto',
+        # v2.0: block size in SECONDS (preferred). Replaces the old
+        # epoch-based default which silently misbehaved on Pis with
+        # non-default epoch periods (a 5-second epoch made 30 "epochs"
+        # = 2.5 min, way too noisy). Default 1800 = 30 min real time.
+        # Smaller = faster convergence, noisier samples. Larger = slower
+        # convergence, more reliable per-block reward.
+        'auto_strategy_block_secs':   1800,
+        # Legacy v1.9 epoch-based block size. If non-zero, OVERRIDES
+        # auto_strategy_block_secs (back-compat for users who hand-tuned
+        # this in v1.9). Set to 0 to use the seconds-based config.
+        'auto_strategy_block_epochs': 0,
+        # UCB1 exploration constant for the strategy meta-bandit. Higher
+        # = more exploration. 1.4 is the textbook default; lower it to
+        # 1.0 if you want the bandit to settle on its current favourite
+        # faster.
+        'auto_strategy_c':            1.4,
+        # How often (epochs) the adaptive strategy does a full universe
+        # sweep. With default ~60s epochs, 15 = ~15 minutes between
+        # sweeps. Lower → more discovery, slightly less yield. Higher →
+        # more yield, slower discovery of new productive channels.
+        'channel_full_sweep_every':  15,
+        # Legacy v1.7.1 option — kept for back-compat. When
+        # channel_strategy is unset (= None / not in user options),
+        # respect_full_channels=True maps to "full", False to "capped".
+        # If channel_strategy IS set explicitly, this is ignored.
+        'respect_full_channels':     None,
 
         # Thermal safety
         'temp_warn':                 70.0,
         'temp_critical':             78.0,
 
+        # v2.2.0 NOAI-ALIGNED STABILITY MODE
+        # When True (default), envtune respects the noai philosophy:
+        # don't add radio activity beyond what natural pwnagotchi does.
+        # Specifically:
+        #   - enable_proactive is FORCED False (no extra wifi.assoc TX)
+        #   - opportunistic_overrides defaults False (no runtime
+        #     wifi.recon.channel pokes from on_bcap_wifi_client_new)
+        #   - When mobility=moving, the strategy meta-bandit drops
+        #     'full' from consideration (battery saver while walking)
+        # Set to False if you have AC power, a stationary Pi, and want
+        # maximum capture rate at the cost of slightly more radio load.
+        'prefer_stability':          True,
+
         # Misc
-        'reset_history':             True,
+        # reset_history: when True, on plugin start we wipe pwnagotchi's
+        # `_history` (per-AP attack counters), bettercap's recon table
+        # (`wifi.recon clear`), bettercap's session state (`wifi.clear`)
+        # and force-set the recon channel list. v1.4.1 changed the
+        # DEFAULT to False because the old `True` default destroyed
+        # useful runtime state on every plugin reload — surprising and
+        # destructive for operators who already had a session in flight.
+        # Set to True if you want a fresh start every plugin restart.
+        'reset_history':             False,
+        # Recon-cycle target (seconds) — used by `_schedule_channels` to
+        # cap the number of channels so one full hop cycle fits in this
+        # budget. Combined with `hop_recon_time` it sets the upper bound
+        # on channel-list size.
+        'target_recon_cycle_secs':   75,
         'opportunistic_min_gap':     2,
         'opportunistic_overrides':   True,
 
         # GPS
         'enable_gps':                True,     # auto-disables if no GPS
         'gps_stale_seconds':         90,
-        'mobility_walk_threshold':   0.5,
-        'mobility_mobile_threshold': 3.0,
+        'mobility_walk_threshold':   0.5,      # m/s; >= this = MOVING
+        # NOTE: v1.5 collapsed mobility to 2-way (stationary/moving), so
+        # there's no longer a separate "walking vs driving" threshold.
+        # The old `mobility_mobile_threshold` was removed in v2.2.
 
-        # Proactive attacks (opt-in even on profiles that allow it)
+        # Proactive attacks (opt-in via prefer_stability=False)
         'proactive_min_rssi':        -68,
-        'proactive_min_clients':     3,
+        # v2.2: minimum fresh clients on the AP for proactive attack to
+        # fire. Strong client presence = more chance the proactive assoc
+        # actually catches an EAPOL exchange.
+        'proactive_min_clients':     1,
         'proactive_gap_epochs':      5,
 
         # Battery (pisugar integration)
@@ -340,6 +1028,31 @@ class EnvTune(plugins.Plugin):
         'enable_wpasec_feedback':    True,
         'potfile_rescan_every_n':    100,    # epochs
         'handshake_rescan_every_n':  200,    # epochs
+
+        # v2.0 (F-10): mood threshold gate — bored/sad penalties only
+        # apply when the mood-counter has been elevated for at least
+        # this many epochs. Prevents warmup penalties.
+        'mood_threshold_epochs':     5,
+
+        # v2.0 (F-13): max distinct channels we keep stats for in the
+        # session-only `_chistos` dict. Prevents unbounded growth over
+        # very long sessions (months) on systems that hop through many
+        # channels. LRU-evicted when exceeded.
+        'chistos_max_channels':      200,
+
+        # v2.0 (F-14): proactive_min_rssi is intentionally a separate
+        # threshold from the bandit's `min_rssi` arm. The bandit picks
+        # the SCAN filter (which APs to track at all). proactive_min_rssi
+        # is the ATTACK-aggression threshold (which APs to fire wifi.assoc
+        # at proactively). These should NOT be merged — proactive is
+        # always more conservative.
+        # The default of -68 is well within the bandit's range (-85 to
+        # -65), so any min_rssi the bandit picks is a permissive enough
+        # filter that proactive targets remain visible.
+
+        # v2.0 (P10): pwnagotchi version compat. Set to false to silence
+        # the version-mismatch warning (e.g. when running a custom fork).
+        'verify_pwnagotchi_version': True,
 
         # Logging
         'log_level':                 'INFO',
@@ -355,10 +1068,13 @@ class EnvTune(plugins.Plugin):
         self._profile = None          # populated in on_loaded
 
         # EMA-smoothed observation signals
+        # v2.1.0: added num_peers, mem_usage, slept_for_secs — verified
+        # against noai pwnagotchi/epoch.py _epoch_data fields.
         self.ema = {k: None for k in (
             'aps', 'hs_rate', 'reward', 'missed_rate', 'hs_per_min',
             'active_ratio', 'inactive_ratio', 'hops_per_epoch',
             'temperature', 'cpu_load', 'speed',
+            'num_peers', 'mem_usage', 'slept_for_secs',
         )}
         self._prev_reward_ema = None
         self._reward_trend    = 0.0
@@ -380,6 +1096,7 @@ class EnvTune(plugins.Plugin):
         self._last_override_ep    = -99
         self._last_proactive_ep   = -99
         self._thermal_throttle    = False
+        self._thermal_saved_params = None  # v2.0 (F-08): pre-throttle param snapshot
         self._mood                = 'neutral'
         self._battery_level       = None    # pisugar integration
         self._session_hs_bssids   = set()   # for per-epoch new_unique calc
@@ -387,9 +1104,24 @@ class EnvTune(plugins.Plugin):
 
         # UCB — initialised in on_loaded
         self.ucb_table        = {}
-        self._decision_buffer = deque(maxlen=5)
+        # Decision buffer — sized in on_loaded after cfg is finalised so
+        # the maxlen scales with reward_delay. v1.5 had hardcoded
+        # maxlen=5; with the dense-environment delay tweak that adds +1,
+        # any user setting reward_delay >= 5 silently never had rewards
+        # attributed (deque saturated below the indexing window).
+        self._decision_buffer = deque(maxlen=12)
         self._ucb_cache       = {}    # (param,state) -> (arm, epoch_set)
         self._ucb_cache_epoch = -1
+        # Per-epoch _ch_score memoisation. Cleared at the start of each
+        # on_epoch and on any state mutation that would change scores.
+        # Without it, a single _schedule_channels pass does ~14² ch_score
+        # calls × ~400 known_aps = ~78 k ops per epoch on dense terrain.
+        self._ch_score_cache  = {}
+        self._ch_score_epoch  = -1
+        # Running counter of real reward samples across the whole UCB
+        # table — drives the shrinkage-k anneal. Was previously
+        # recomputed by walking ~9 k cells on every arm pick (14×/epoch).
+        self._total_real_samples = 0
 
         # Which pwnagotchi params this fork actually exposes
         self._active_params = set(self.UCB_ARMS.keys())
@@ -400,7 +1132,6 @@ class EnvTune(plugins.Plugin):
 
         # Lifetime stats (persistent)
         self.lifetime_handshakes = 0
-        self.session_start_wall  = time.time()
         self.session_start_mono  = time.monotonic()
         # Per-session HS counter (incl. duplicates of already-captured
         # BSSIDs). Used by /metrics for envtune_session_duplicates.
@@ -419,11 +1150,15 @@ class EnvTune(plugins.Plugin):
         self._bcap_skip_macs           = set()
         self._bcap_skip_pushed_count   = 0
 
-        # Channel lifetime dict  ch → stats (persistent)
+        # Channel lifetime dict  ch → stats (persistent).
+        # v1.6: removed the dead 'cracked' counter (only ever read in
+        # _ch_score, never written anywhere). Channel "cracked
+        # productivity" is better expressed via the GPS-zone-level
+        # cracked count if we ever need it.
         self._ch_lt = defaultdict(lambda: {
             'hs': 0, 'assocs': 0, 'deauths': 0,
             'clients': 0, 'visits': 0, 'wasted': 0,
-            'free_seen': 0, 'passive_hs': 0, 'cracked': 0,
+            'free_seen': 0, 'passive_hs': 0,
         })
         self._dead_lt = defaultdict(int)
 
@@ -433,6 +1168,42 @@ class EnvTune(plugins.Plugin):
         self._unscanned_channels = []
         self._dead_session       = defaultdict(int)
         self._free_channels      = deque(maxlen=8)   # recent free-channel reports
+        # v1.7.1: user's original `personality.channels` (or the iface's
+        # full supported list if the user left it empty). Captured ONCE
+        # in on_ready, never modified by envtune. Used as the channel
+        # universe — envtune's `next_chs` output never goes below this
+        # set when `respect_full_channels=True`. None until on_ready.
+        self._user_channels_orig = None
+        # v1.8.0: last epoch we did a full universe sweep. Used by the
+        # adaptive channel_strategy to schedule sweeps every
+        # channel_full_sweep_every epochs. -999 = "do a sweep on first
+        # opportunity" so the bandit gets initial coverage even if
+        # restarted mid-stable-environment.
+        self._last_full_sweep_ep = -999
+        # v2.0 (A1): MOBILITY-AWARE meta-bandit. v1.9 had a single 3-arm
+        # bandit; v2.0 has TWO 3-arm bandits — one per mobility — because
+        # community evidence + math show different strategies are optimal
+        # under different mobility regimes (capped wins when stationary;
+        # full sweep often wins when moving because the AP λ-distribution
+        # changes faster than capped can rediscover).
+        # Schema: {mobility: {strategy: {'n': int, 'rewards': deque}}}
+        # Persisted in state JSON. v1.9 flat schema migrates: existing
+        # stats are seeded into BOTH mobilities as warm priors.
+        self._strategy_bandit = {
+            mobility: {
+                s: {'n': 0, 'rewards': deque(maxlen=20)}
+                for s in ('adaptive', 'full', 'capped')
+            }
+            for mobility in (self.MOBILITY_STATIONARY, self.MOBILITY_MOVING)
+        }
+        # Block tracking (session-only; recovers cleanly on restart by
+        # cold-starting the next block).
+        # v2.0 (F-09): None (clean) instead of -999 sentinel.
+        self._strategy_current        = None       # strategy in this block
+        self._strategy_block_start_ep = None       # epoch the block began
+        self._strategy_block_start_mono = None     # wall-clock start (F-05)
+        self._strategy_block_mobility = None       # mobility at block start
+        self._uniques_at_block_start  = 0          # to compute block reward
 
         # AP tracking
         self._known_aps        = {}
@@ -464,6 +1235,14 @@ class EnvTune(plugins.Plugin):
         self._save_queue   = queue.Queue(maxsize=4)
         self._save_thread  = None
         self._save_stop    = threading.Event()
+        # v2.0 (R-01): cached snapshot for /export — updated by the save
+        # worker thread when it writes to disk. /export serves this
+        # cache instead of building a fresh snapshot on the webhook
+        # thread (which was a 50–200ms operation on Pi Zero 2 W).
+        # Stale by at most save_every_n epochs, which is fine for an
+        # export endpoint (operators don't need millisecond freshness).
+        self._cached_snapshot       = None
+        self._cached_snapshot_at    = 0.0   # wall-clock time of cache
 
         # Web-UI action log (rolling, last 20). CSRF protection comes from
         # pwnagotchi's flask_wtf.CSRFProtect middleware — we use the
@@ -473,27 +1252,47 @@ class EnvTune(plugins.Plugin):
         # Plugin wiring
         self._agent     = None
         self._ui        = None
-        self.last_shake = {'time': time.time()}
+        # v2.1.0: resolved at on_ready from agent._config. Fallbacks are
+        # the noai-default paths so first-load (before on_ready) doesn't
+        # crash on access.
+        self._hs_dir         = self.HANDSHAKE_DIR_FALLBACK
+        self._wpasec_pot     = self.WPASEC_POT_FALLBACK
+        self._bcap_silenced_events = set()  # populated in on_ready from cfg
+        # v2.0 (F-12): full schema so UI never sees a partial dict on
+        # first render, before any handshake has been recorded.
+        self.last_shake = {
+            'time': time.time(),
+            'ap': None,
+            'cl': None,
+            'passive': False,
+            'lifetime_new': False,
+        }
+        # v2.0 (P-11): error counters per handler. Exposed via /metrics
+        # so ops dashboards can detect when a handler is consistently
+        # failing.
+        self._error_counts = defaultdict(int)
 
     # ─────────────────────────────────────────────────────────────────────
-    # State-space definition
+    # State-space definition (v4 schema, 24 states)
     # ─────────────────────────────────────────────────────────────────────
-    # State key format: "density_tod_trend_mobility"
-    #   density:  sparse / medium / dense
-    #   tod:      night / morning / afternoon / evening
-    #   trend:    falling / stable / rising
-    #   mobility: stationary / walking / mobile
-    # Total: 3×4×3×3 = 108 base states (plus optional GPS zone suffix)
+    # State key format: "density_tod_mobility"
+    #   density:  sparse / medium / dense                 (3)
+    #   tod:      night / morning / afternoon / evening   (4)
+    #   mobility: stationary / moving                     (2)
+    # Total: 3×4×2 = 24 base states.
+    #
+    # 4.5× sample-efficiency improvement vs the v1.4 108-state schema.
+    # `trend` was dropped (redundant with stagnation+saturation logic),
+    # walking+mobile merged into 'moving' (empirically same optimal
+    # params).
     # ─────────────────────────────────────────────────────────────────────
 
     def _all_states(self):
         return [
-            f'{d}_{t}_{r}_{m}'
+            f'{d}_{t}_{m}'
             for d in ('sparse', 'medium', 'dense')
             for t in ('night', 'morning', 'afternoon', 'evening')
-            for r in ('falling', 'stable', 'rising')
-            for m in (self.MOBILITY_STATIONARY, self.MOBILITY_WALKING,
-                      self.MOBILITY_MOBILE)
+            for m in (self.MOBILITY_STATIONARY, self.MOBILITY_MOVING)
         ]
 
     def _init_ucb_table(self):
@@ -567,14 +1366,36 @@ class EnvTune(plugins.Plugin):
     def _migrate_state_key(self, old_key, from_schema):
         """
         Migrate state keys between schema versions.
-          v1 → states had 3 components (density_tod_trend)
-          v2 → same
-          v3 → added mobility: density_tod_trend_mobility
+          v1, v2 → density_tod_trend (3 components, no mobility)
+          v3     → density_tod_trend_mobility (4 components, 108 states)
+          v4     → density_tod_mobility (3 components, 24 states)
+
+        v4 collapses two dimensions:
+          - drop `trend` entirely (rising/stable/falling all merge)
+          - merge mobility {walking, mobile} → 'moving'
+        Up to 6 old keys map onto each new key. The deserialiser
+        concatenates their reward histories (keeping only ucb_window
+        most recent), so no learning is lost.
         """
         parts = old_key.split('_')
+        # v3 → v4: 4 components → 3 (drop trend at index 2; collapse mobility)
+        if from_schema == 3 and len(parts) == 4:
+            density, tod, _trend, mobility = parts
+            if mobility in (self.MOBILITY_WALKING, self.MOBILITY_MOBILE):
+                mobility = self.MOBILITY_MOVING
+            elif mobility != self.MOBILITY_STATIONARY:
+                mobility = self.MOBILITY_STATIONARY  # safety
+            return f'{density}_{tod}_{mobility}'
+        # v1/v2 → v4: 3 components without mobility → assume stationary
         if from_schema < 3 and len(parts) == 3:
-            # Assume stationary — safest default for migrated data
-            return old_key + '_' + self.MOBILITY_STATIONARY
+            density, tod, _trend = parts
+            return f'{density}_{tod}_{self.MOBILITY_STATIONARY}'
+        # Already v4 (3 components with mobility) — pass through
+        if len(parts) == 3:
+            density, tod, mobility = parts
+            if mobility in (self.MOBILITY_WALKING, self.MOBILITY_MOBILE):
+                mobility = self.MOBILITY_MOVING
+            return f'{density}_{tod}_{mobility}'
         return old_key
 
     # ─────────────────────────────────────────────────────────────────────
@@ -621,95 +1442,115 @@ class EnvTune(plugins.Plugin):
                 'recon_inactive_multiplier': 2,
             },
         }
-        # Mobility adjustments: mobile = shorter TTLs, shorter recon
+        # Mobility adjustments — v4 schema (2-way only)
         mobility_adjust = {
             self.MOBILITY_STATIONARY: {'ap_ttl': +60, 'sta_ttl': +120, 'recon_time': +5},
-            self.MOBILITY_WALKING:    {},
-            self.MOBILITY_MOBILE:     {'ap_ttl': -40, 'sta_ttl': -100, 'recon_time': -5},
+            self.MOBILITY_MOVING:     {'ap_ttl': -30, 'sta_ttl': -80,  'recon_time': -5},
         }
-        PRIOR_R = 0.30
+        # v2.0 (F-03): single source of truth for the neutral prior.
+        PRIOR_R = self.PRIOR_NEUTRAL_R
 
+        # v4 SCHEMA: state = density_tod_mobility (24 states, no trend)
         for density in ('sparse', 'medium', 'dense'):
             for tod, vals in tod_priors.items():
-                for trend in ('falling', 'stable', 'rising'):
-                    for mobility in (self.MOBILITY_STATIONARY,
-                                     self.MOBILITY_WALKING,
-                                     self.MOBILITY_MOBILE):
-                        state = f'{density}_{tod}_{trend}_{mobility}'
-                        adj   = mobility_adjust.get(mobility, {})
-                        for param, preferred in vals.items():
-                            if param not in self.UCB_ARMS:
-                                continue
-                            pref = preferred + adj.get(param, 0)
-                            self._ensure_state(param, state)
-                            arms    = self.UCB_ARMS[param]
-                            nearest = min(arms, key=lambda a: abs(a - pref))
-                            entry   = self.ucb_table[param][state][nearest]
-                            if entry['n'] == 0:
-                                entry['n'] = 1
-                                entry['rewards'].append(PRIOR_R)
+                for mobility in (self.MOBILITY_STATIONARY,
+                                 self.MOBILITY_MOVING):
+                    state = f'{density}_{tod}_{mobility}'
+                    adj   = mobility_adjust.get(mobility, {})
+                    for param, preferred in vals.items():
+                        if param not in self.UCB_ARMS:
+                            continue
+                        pref = preferred + adj.get(param, 0)
+                        self._ensure_state(param, state)
+                        arms    = self.UCB_ARMS[param]
+                        nearest = min(arms, key=lambda a: abs(a - pref))
+                        entry   = self.ucb_table[param][state][nearest]
+                        if entry['n'] == 0:
+                            entry['n'] = 1
+                            entry['rewards'].append(PRIOR_R)
 
-    def _hierarchical_marginal(self, param, state):
+    def _apply_personality_warmstart(self, agent):
+        """Seed the bandit with whatever pwnagotchi's personality is
+        configured to right now.
+
+        v2.0 (F-02 docstring update): the synthetic sample is at the
+        NEUTRAL prior level (R=0.30 by default, equal to the TOD
+        prior). This gives the user-configured arm the same status as
+        any seeded arm — it gets to skip the "untried-arm" branch of
+        UCB selection without actively biasing the mean toward it.
+        Real evidence (n>1 actual rewards) overrides immediately.
+        v1.6 had R=0.45 here, which created the "sticky warmstart"
+        pattern where suboptimal user defaults locked the bandit for
+        thousands of epochs (e.g. ap_ttl=120 at mean 0.064 vs
+        ap_ttl=60 at 0.247 in real community telemetry).
+
+        Skipped silently if the agent isn't ready.
         """
-        Compute the marginal mean reward for a parameter, averaged
-        across all states that share 2+ dimensions with the target
-        state. This lets rare states benefit from common ones.
-
-        Returns (mean, total_weight) or (None, 0) if insufficient data.
-        """
-        target_parts = state.split('_')
-        if len(target_parts) != 4:
-            return None, 0
-
-        totals = defaultdict(lambda: [0.0, 0])   # arm -> [sum_reward, n]
-
-        for other_state, arms in self.ucb_table.get(param, {}).items():
-            other_parts = other_state.split('_')
-            if len(other_parts) != 4 or other_state == state:
+        if agent is None:
+            return
+        try:
+            p = agent._config.get('personality') or {}
+        except Exception:
+            return
+        # v2.0 (F-01): fallback default matches DEFAULTS (PRIOR_NEUTRAL_R).
+        WARM_R = float(self.cfg.get('warmstart_prior_reward',
+                                    self.PRIOR_NEUTRAL_R))
+        for param in self.UCB_ARMS:
+            if param not in p:
                 continue
-            # Count shared dimensions
-            shared = sum(1 for a, b in zip(target_parts, other_parts) if a == b)
-            if shared < 2:
+            try:
+                user_val = float(p[param])
+            except (TypeError, ValueError):
                 continue
-            # Weight by similarity (3 shared = 1.0, 2 shared = 0.25)
-            weight = 1.0 if shared == 3 else 0.25
-            for arm, d in arms.items():
-                if d['n'] > 0 and d['rewards']:
-                    mean = sum(d['rewards']) / len(d['rewards'])
-                    totals[arm][0] += mean * weight * d['n']
-                    totals[arm][1] += weight * d['n']
+            arms    = self.UCB_ARMS[param]
+            nearest = min(arms, key=lambda a: abs(a - user_val))
+            for state in self._all_states():
+                self._ensure_state(param, state)
+                entry = self.ucb_table[param][state][nearest]
+                # Only warm-start arms that have NO real data yet.
+                # Don't overwrite cells already learned during a long
+                # session if the user reloads the plugin.
+                if entry['n'] == 0:
+                    entry['n'] = 1
+                    entry['rewards'].append(WARM_R)
+                elif (entry['n'] == 1 and entry['rewards']
+                      and abs(entry['rewards'][0] - self.PRIOR_NEUTRAL_R) < 1e-6):
+                    # n=1 with the seeded NEUTRAL prior — replace
+                    # with the warm-start value (still n=1, but a
+                    # better starting point).
+                    entry['rewards'].clear()
+                    entry['rewards'].append(WARM_R)
+        log.info(
+            f'[envtune] personality warm-start applied '
+            f'(prior reward {WARM_R:.2f} on user-configured arms)')
 
-        if not totals:
-            return None, 0
-
-        # Pick the arm with the highest weighted mean as the marginal best
-        best_arm  = None
-        best_mean = -1.0
-        best_n    = 0
-        for arm, (wsum, wn) in totals.items():
-            if wn > 0:
-                m = wsum / wn
-                if m > best_mean:
-                    best_mean = m
-                    best_arm  = arm
-                    best_n    = wn
-        return best_arm, best_n
+    # NOTE: _hierarchical_marginal was deleted in v1.6 — subsumed by the
+    # shrinkage-aware UCB pick (_sw_ucb_pick_with_state + _arm_parent_mean).
+    # The shrinkage path pulls each cell's mean toward the parent prior
+    # in proportion to how undersampled the cell is, achieving the same
+    # "rare contexts borrow from common ones" goal but continuously
+    # rather than as a discrete fallback.
 
     # ─────────────────────────────────────────────────────────────────────
     # Context / state computation
     # ─────────────────────────────────────────────────────────────────────
 
     def _compute_mobility(self):
-        """Infer mobility from GPS speed (if available) or AP turnover."""
+        """Infer mobility from GPS speed (if available) or AP turnover.
+
+        v4 schema: 2-way classification only (stationary vs moving).
+        Walking/mobile are folded into a single 'moving' state because
+        empirically they require similar param adjustments (short
+        ap_ttl, faster recon) and merging them gives 50% more samples
+        per cell.
+        """
         # GPS-based (preferred when available)
         if self._gps_last_fix is not None:
             speed = _sf(self._gps_last_fix.get('speed', 0))
             age   = time.monotonic() - self._gps_last_fix['ts_mono']
             if age <= self.cfg['gps_stale_seconds']:
-                if speed >= self.cfg['mobility_mobile_threshold']:
-                    return self.MOBILITY_MOBILE
                 if speed >= self.cfg['mobility_walk_threshold']:
-                    return self.MOBILITY_WALKING
+                    return self.MOBILITY_MOVING
                 return self.MOBILITY_STATIONARY
 
         # Fallback: AP turnover heuristic
@@ -720,14 +1561,26 @@ class EnvTune(plugins.Plugin):
             all_chs = set()
             for fp in recent:
                 all_chs.update(fp.get('top', []))
-            if len(all_chs) >= 8:
-                return self.MOBILITY_MOBILE
             if len(all_chs) >= 5:
-                return self.MOBILITY_WALKING
+                return self.MOBILITY_MOVING
         return self.MOBILITY_STATIONARY
 
     def _compute_state(self, aps_ema):
-        """Map current observations to a discrete state key."""
+        """Map current observations to a discrete state key.
+
+        v4 SCHEMA — 24 states (was 108 in v3).
+          density (3) × tod (4) × mobility (2) = 24
+
+        The `trend` dimension was dropped because telemetry showed it
+        carried almost no signal: 87% of `*_*_falling_*` cells stayed
+        at the seeded prior, and stagnation/saturation detection
+        already triggers exploration boost when reward drops.
+
+        Mobility was collapsed from 3-way to 2-way (stationary/moving)
+        because walking and driving optimal params are nearly identical
+        in practice. Net result: 4.5× more samples per cell, ~3×
+        faster convergence.
+        """
         # AP density
         if aps_ema >= self.cfg['dense_aps']:
             density = 'dense'
@@ -743,15 +1596,10 @@ class EnvTune(plugins.Plugin):
         elif h < 18:    tod = 'afternoon'
         else:           tod = 'evening'
 
-        # Reward trend (EMA delta)
-        if self._reward_trend > 0.02:   trend = 'rising'
-        elif self._reward_trend < -0.02: trend = 'falling'
-        else:                            trend = 'stable'
-
-        # Mobility (cached per-epoch)
+        # Mobility (cached per-epoch) — 2-way only in v1.5
         mobility = self._current_mobility
 
-        return f'{density}_{tod}_{trend}_{mobility}'
+        return f'{density}_{tod}_{mobility}'
 
     # ─────────────────────────────────────────────────────────────────────
     # UCB arm selection (Sliding-Window UCB1 with hierarchical fallback)
@@ -762,30 +1610,49 @@ class EnvTune(plugins.Plugin):
         Pick best arm for (param, state).
 
         Algorithm:
-          1. If any arm has zero observations (even after priors): try it.
-          2. If the whole state is sparse (< 3 arms with data), use the
-             hierarchical marginal from similar states.
-          3. Otherwise: standard SW-UCB1 with annealed C.
+          1. v1.7 forced-exploration floor: if forced_explore_every is
+             active and any arm has n < forced_explore_starvation_n,
+             force-pick the most-starved arm to guarantee minimum
+             coverage. Closes the UCB1 starvation pattern observed in
+             real community telemetry.
+          2. If any arm has zero observations (even after priors): try it.
+          3. Shrinkage-aware UCB self-handles sparse cells by pulling
+             toward the parent group's mean.
         """
-        # Cache: return cached choice if we computed this recently
+        self._ensure_state(param, state)
+        arms  = self.UCB_ARMS[param]
+        table = self.ucb_table[param][state]
+
+        # 1. Forced exploration. We compute the same trigger condition
+        # for every (param, state) call this epoch; it's cheap and
+        # avoids needing global state about which params we've forced.
+        # Note: forced selections deliberately bypass the UCB cache so
+        # successive epochs with cached arms don't lock out the floor.
+        every = int(self.cfg.get('forced_explore_every', 0))
+        if every > 0 and self.epochs_seen > 0 and self.epochs_seen % every == 0:
+            starved_n = int(self.cfg.get('forced_explore_starvation_n', 5))
+            starved = [(a, table[a]['n']) for a in arms
+                       if table[a]['n'] < starved_n]
+            if starved:
+                # Tie-break: lowest n wins, random among equally starved.
+                min_n = min(n for _, n in starved)
+                candidates = [a for a, n in starved if n == min_n]
+                return random.choice(candidates)
+
+        # Cache: return cached choice if we computed this recently.
+        # Only consulted when forced exploration didn't fire.
         cache_key = (param, state)
         if (self._profile['ucb_cache_epochs'] > 0
                 and cache_key in self._ucb_cache
                 and self.epochs_seen < self._ucb_cache[cache_key][1]):
             return self._ucb_cache[cache_key][0]
 
-        self._ensure_state(param, state)
-        arms  = self.UCB_ARMS[param]
-        table = self.ucb_table[param][state]
-
-        # Try untried arms first (post-prior)
+        # 2. Try untried arms first (post-prior)
         untried = [a for a in arms if table[a]['n'] == 0]
         if untried:
             choice = random.choice(untried)
         else:
-            # Shrinkage-aware UCB ALWAYS — it self-handles sparse cells
-            # by pulling toward the parent group, so we no longer need a
-            # separate hierarchical-marginal branch.
+            # 3. Shrinkage-aware UCB
             choice = self._sw_ucb_pick_with_state(param, state, arms, table)
 
         # Cache
@@ -799,6 +1666,20 @@ class EnvTune(plugins.Plugin):
         Empirical-Bayes prior for an arm: weighted mean of this arm's
         rewards across (a) states sharing 2+ context dims (preferred),
         falling back to (b) population mean across ALL states.
+
+        v1.6 FIX: schema check is now `len == 3` (density_tod_mobility),
+        matching the v1.5 schema collapse. The old `len == 4` check was
+        a leftover from v1.4 (density_tod_trend_mobility) and silently
+        disabled the dimension-weighted parent prior, leaving shrinkage
+        falling back to flat population mean across all 24 states. The
+        plugin's headline claim "rare contexts benefit from common ones"
+        was effectively false until this fix.
+
+        Weighting: states sharing 2 dims get full weight 1.0 (e.g.
+        target=`dense_evening_stationary`, neighbour=`dense_evening_moving`
+        is 2 dims shared, very informative). 1 dim shared gets 0.25.
+        0 dims shared (entirely different context) is excluded — the
+        population fallback handles those.
 
         Returns float prior, or None if there's no data anywhere.
         """
@@ -817,12 +1698,18 @@ class EnvTune(plugins.Plugin):
             pop_sum += m * n
             pop_n   += n
             op = other_state.split('_')
-            if len(op) == 4 and len(target_parts) == 4:
+            if len(op) == 3 and len(target_parts) == 3:
                 shared = sum(1 for a, b in zip(target_parts, op) if a == b)
-                if shared >= 2:
-                    w = 1.0 if shared == 3 else 0.4
-                    parent_sum += m * w * n
-                    parent_n   += w * n
+                if shared >= 1:
+                    # 2 shared dims = highly relevant neighbour (1.0)
+                    # 1 shared dim  = moderately relevant (0.25)
+                    w = 1.0 if shared == 2 else 0.25
+                    # Use sqrt(n) instead of n so an n=200 distantly-
+                    # related state doesn't drown out an n=5 closely-
+                    # related state (was a v1.5 weighting bug).
+                    sqrt_n = math.sqrt(n)
+                    parent_sum += m * w * sqrt_n
+                    parent_n   += w * sqrt_n
 
         if parent_n > 0:
             return parent_sum / parent_n
@@ -846,6 +1733,11 @@ class EnvTune(plugins.Plugin):
 
         If ucb_shrinkage_k is set explicitly in user config (legacy
         v1.1 behaviour), that fixed value is used and anneal is skipped.
+
+        v1.6 PERF: was walking the entire UCB table (~9 k cells) on
+        every arm pick — 14 picks/epoch → 126 k iterations/epoch.
+        Now uses `_total_real_samples`, a running counter that's
+        incremented in `_ucb_update`. O(1) per call.
         """
         fixed = self.cfg.get('ucb_shrinkage_k')
         if fixed is not None:
@@ -856,16 +1748,28 @@ class EnvTune(plugins.Plugin):
         k_max = float(self.cfg.get('ucb_shrinkage_k_max', 5.0))
         k_min = float(self.cfg.get('ucb_shrinkage_k_min', 1.0))
         anneal = max(1, int(self.cfg.get('ucb_shrinkage_anneal_samples', 500)))
-        # Count total real-sample volume across the entire UCB table.
-        # This is independent of any single arm so cold-start cells
-        # benefit from heavy k even after the table is mature.
+        frac = min(1.0, self._total_real_samples / anneal)
+        return k_max - (k_max - k_min) * frac
+
+    def _record_error(self, handler):
+        """v2.0 (P-11): increment per-handler exception counter.
+        Exposed via /metrics for ops dashboards."""
+        try:
+            self._error_counts[handler] += 1
+        except Exception:
+            pass
+
+    def _recompute_total_real_samples(self):
+        """Walk the full UCB table once to seed `_total_real_samples`.
+        Called after `_load_state` and `_apply_tod_prior` /
+        `_apply_personality_warmstart` (which inject synthetic samples
+        with n=1)."""
         total = 0
         for states in self.ucb_table.values():
             for arms in states.values():
                 for d in arms.values():
                     total += d.get('n', 0)
-        frac = min(1.0, total / anneal)
-        return k_max - (k_max - k_min) * frac
+        self._total_real_samples = total
 
     def _sw_ucb_pick_with_state(self, param, state, arms, table):
         """
@@ -910,32 +1814,6 @@ class EnvTune(plugins.Plugin):
                 best_arm   = arm
         return best_arm
 
-    # Back-compat shim: existing call sites pass (arms, table).
-    def _sw_ucb_pick(self, arms, table):
-        # Reconstruct (param, state) from caller's frame. Only used by old
-        # callers that haven't been switched to the with_state form.
-        # For correctness we just fall back to the un-shrunk path.
-        if self._exploration_boost > 0:
-            C = self.cfg['exploration_boost_c']
-        else:
-            frac   = min(1.0, self.epochs_seen / self.cfg['ucb_c_anneal_epochs'])
-            C_min  = self.cfg['ucb_c_floor']
-            C_max  = self.cfg['ucb_c']
-            C      = C_max - (C_max - C_min) * frac
-        total_w = sum(len(table[a]['rewards']) for a in arms)
-        best_score = -math.inf
-        best_arm   = arms[0]
-        for arm in arms:
-            d      = table[arm]
-            w_size = len(d['rewards'])
-            mean   = sum(d['rewards']) / w_size if w_size > 0 else 0.0
-            expl   = C * math.sqrt(math.log(max(1, total_w)) / max(1, w_size))
-            score  = mean + expl
-            if score > best_score:
-                best_score = score
-                best_arm   = arm
-        return best_arm
-
     def _ucb_update(self, param, state, arm, reward):
         """Record a reward observation for (param, state, arm)."""
         if param not in self._active_params:
@@ -947,6 +1825,10 @@ class EnvTune(plugins.Plugin):
             tbl[arm] = {'n': 0, 'rewards': deque(maxlen=W)}
         tbl[arm]['n'] += 1
         tbl[arm]['rewards'].append(float(reward))
+        # Maintain the running sample-count for shrinkage anneal — was
+        # previously recomputed by walking the full table on every arm
+        # pick (v1.5).
+        self._total_real_samples += 1
         # Invalidate cache for this (param, state)
         self._ucb_cache.pop((param, state), None)
 
@@ -974,63 +1856,69 @@ class EnvTune(plugins.Plugin):
     def _custom_reward(self, handshakes, hs_rate, missed_rate, native_reward,
                        duration_secs, lifetime_new_this_epoch,
                        active_ratio, inactive_ratio, hops_ratio,
-                       new_aps_seen, attack_efficiency_proxy, interactions,
+                       new_aps_seen, interactions,
                        blind_ratio=0.0, bored_ratio=0.0, sad_ratio=0.0):
         """
-        UNIQUE-handshake-maximising reward.
+        UNIQUE-handshake-maximising reward (v1.5 — pure unique focus).
 
-        The PRIMARY objective is lifetime-new BSSIDs per minute. Catching the
-        same network 10 times = same reward as catching it once. Catching a
-        brand-new network = full reward.
+        v1.5 deliberately removed weights that were polluting the
+        signal:
+          - native_reward (was 0.03): pwnagotchi's own reward counts
+            TOTAL handshakes including duplicates, contradicting the
+            unique-only goal. Removed.
+          - work_term (was 0.04): "we attacked, even if we caught
+            nothing" — too indirect; the activity floor handles the
+            "tried something" case more cleanly. Removed.
+
+        82% of positive reward weight now goes directly to unique-HS
+        signals (new_term + eff_term). Penalties unchanged.
 
         Components (all normalised to [0,1]):
-          - lifetime-new HS per minute         (0.60)  primary objective
-          - new APs discovered this epoch      (0.10)  exploration value
-          - unique-HS-per-attack efficiency    (0.08)  duplicates don't help
-          - inverse missed rate                (0.06)  efficiency
-          - pwnagotchi active ratio            (0.05)  signal we are working
-          - channel hop diversity              (0.04)  coverage
-          - native pwnagotchi reward           (0.03)  loose alignment
-          - "underlying work" baseline         (0.04)  prevents 0-hs deadzones
-                                                       from learning nothing
-          - penalty: inactive ratio            (-0.05) penalty for stalls
-          - penalty: blind ratio               (-0.07) radio sees nothing —
-                                                      strong signal to
-                                                      change scanning params
+          - lifetime-new HS per minute         (0.70)  PRIMARY GOAL
+          - unique-HS-per-attack efficiency    (0.12)  duplicates penalised
+          - new APs discovered this epoch      (0.08)  exploration value
+          - inverse missed rate                (0.04)  efficiency
+          - pwnagotchi active ratio            (0.03)  working signal
+          - channel hop diversity              (0.03)  coverage
+          - penalty: inactive ratio            (-0.05) stalls
+          - penalty: blind ratio               (-0.07) radio sees nothing
+          - penalty: sad / bored               (-0.04 / -0.03)
+
         Floor:
-          - 0.01 if there were any interactions, so UCB still distinguishes
-            'tried something but failed' from 'did nothing'.
+          - 0.01 if there were any interactions, so UCB still
+            distinguishes 'tried but failed' from 'did nothing'.
         """
         dur_min        = max(0.01, duration_secs / 60.0)
         hs_per_min     = handshakes / dur_min
         new_per_min    = lifetime_new_this_epoch / dur_min
-        # NB: stored in _recent_hpm but tracks UNIQUE-per-min, not total.
+
+        # v1.4.1 FIX: compute target BEFORE appending current epoch's
+        # value, otherwise the current sample influences its own target.
+        target = self._adaptive_hpm_target()
         self._recent_hpm.append(new_per_min)
 
-        target = self._adaptive_hpm_target()
-
-        # 1) PRIMARY: lifetime-new captures per minute against adaptive target.
-        # Telemetry showed the previous log-scaling buried the signal:
-        # ratio=1 (you HIT the target) only scored 0.20, indistinguishable
-        # from the seeded UCB prior of 0.30 once weighted. UCB therefore
-        # could not tell "good epoch" from "no data". Use a Hill-style
-        # saturation r = ratio/(ratio+k) with k=1, which gives a sharp
-        # gradient where it matters and gentle saturation above:
+        # 1) PRIMARY — lifetime-new HS per minute, Hill-saturated.
         #   ratio=0       → 0.00
         #   ratio=0.5     → 0.33
-        #   ratio=1.0     → 0.50  (target hit — clearly above 0.30 prior)
+        #   ratio=1.0     → 0.50  (target hit, well above 0.30 prior)
         #   ratio=2.0     → 0.67
         #   ratio=4.0     → 0.80
-        #   ratio=8.0     → 0.89
         if target > 0 and new_per_min > 0:
             ratio = new_per_min / target
             new_term = ratio / (ratio + 1.0)
         else:
             new_term = 0.0
 
-        # 2) UNIQUE handshake efficiency per attack — duplicates don't count.
-        # Catching the same AP 10× shouldn't beat catching 1 new AP once.
-        eff_term = min(1.0, lifetime_new_this_epoch / max(1, interactions))
+        # 2) UNIQUE-per-attack efficiency. v1.5 uses the same Hill
+        # saturation as the primary term so the gradient matches:
+        # 1 unique per 10 attempts → 0.5 (target), more is better.
+        # This ensures attack budget is spent on UNIQUE captures —
+        # a duplicate-only epoch gets near-zero credit here.
+        if interactions > 0 and lifetime_new_this_epoch > 0:
+            eff_ratio = (lifetime_new_this_epoch * 10.0) / interactions
+            eff_term  = eff_ratio / (eff_ratio + 1.0)
+        else:
+            eff_term  = 0.0
 
         # 3) Inverse missed rate
         miss_term = max(0.0, 1.0 - missed_rate)
@@ -1047,63 +1935,43 @@ class EnvTune(plugins.Plugin):
         # 7) Inactive penalty
         inactive_pen = min(1.0, inactive_ratio)
 
-        # 7b) Blind penalty — radio "sees nothing" is a strong signal that
-        # scan params (channels / hop_recon_time / recon_time) are wrong.
-        # Original pwnagotchi AI used -0.30 here; we soften to -0.07 because
-        # we already have an explicit blind-recovery state machine that
-        # forces aggressive params, but keeping a small reward signal lets
-        # UCB shy away from arms that lead to blindness.
+        # 8) Blind penalty — radio "sees nothing" → scan params wrong
         blind_pen = min(1.0, max(0.0, blind_ratio))
 
-        # 7c) Mood penalties — pwnagotchi spends time bored/sad means it
-        # was idle long enough to flip emotion. Original AI weighted these
-        # at -0.20 / -0.10; we use smaller weights since blind_pen + the
-        # active_term already cover most of the same signal.
+        # 9) Mood penalties — bored/sad means we were idle long enough
+        # to flip emotion. Original AI weighted these at -0.20/-0.10;
+        # we soften because blind_pen + active_term overlap signals.
         bored_pen = min(1.0, max(0.0, bored_ratio))
         sad_pen   = min(1.0, max(0.0, sad_ratio))
 
-        # 8) Native reward
-        native_term = min(1.0, max(0.0, _sf(native_reward)))
-
-        # 9) "Underlying work" baseline — even when 0 HS, reward attempting
-        # the right things (so UCB still learns in sparse environments)
-        work_term = min(1.0, attack_efficiency_proxy)
-
         r = (
-            0.60 * new_term         # this IS the goal
-          + 0.10 * new_aps_term
-          + 0.08 * eff_term
-          + 0.06 * miss_term
-          + 0.05 * active_term
-          + 0.04 * hops_term
+            0.70 * new_term         # PRIMARY GOAL
+          + 0.12 * eff_term         # unique-per-attack
+          + 0.08 * new_aps_term     # discovery
+          + 0.04 * miss_term        # efficiency
+          + 0.03 * active_term      # working signal
+          + 0.03 * hops_term        # coverage
           - 0.05 * inactive_pen
           - 0.07 * blind_pen
           - 0.04 * sad_pen
           - 0.03 * bored_pen
-          + 0.03 * native_term
-          + 0.04 * work_term
         )
-        # Activity floor: if we did anything at all this epoch, give UCB a
-        # small but non-zero gradient. Prevents arms from looking equally
-        # bad at 0.0 in long deadzones.
+        # Activity floor: distinguish "tried but failed" from "nothing".
         if interactions > 0 and new_per_min == 0:
             r = max(r, 0.01)
 
-        # Optional: stash component breakdown for debug logging. Avoids
-        # recomputing in the on_epoch summary line.
+        # Per-component breakdown for the dashboard panel.
         self._last_reward_breakdown = {
-            'new':      0.60 * new_term,
-            'new_aps':  0.10 * new_aps_term,
-            'eff':      0.08 * eff_term,
-            'miss':     0.06 * miss_term,
-            'active':   0.05 * active_term,
-            'hops':     0.04 * hops_term,
+            'new':      0.70 * new_term,
+            'eff':      0.12 * eff_term,
+            'new_aps':  0.08 * new_aps_term,
+            'miss':     0.04 * miss_term,
+            'active':   0.03 * active_term,
+            'hops':     0.03 * hops_term,
             'inact':   -0.05 * inactive_pen,
             'blind':   -0.07 * blind_pen,
             'sad':     -0.04 * sad_pen,
             'bored':   -0.03 * bored_pen,
-            'native':   0.03 * native_term,
-            'work':     0.04 * work_term,
         }
         return max(0.0, min(1.0, r))
 
@@ -1128,6 +1996,10 @@ class EnvTune(plugins.Plugin):
         'temperature':    (-40.0, 130.0),
         'cpu_load':       (0.0, 1.0),
         'speed':          (0.0, 200.0),
+        # v2.1.0 fields verified in noai _epoch_data
+        'num_peers':      (0.0, 100.0),
+        'mem_usage':      (0.0, 1.0),     # 0.0–1.0 fraction
+        'slept_for_secs': (0.0, 600.0),
     }
 
     def _ema(self, key, value):
@@ -1155,6 +2027,19 @@ class EnvTune(plugins.Plugin):
             new = lo
         elif new > hi:
             new = hi
+        # v1.7 DENORMAL FLOOR: when a [0, 1]-clamped EMA decays below
+        # 1e-6 from many consecutive zero inputs, snap to exactly 0.
+        # Real community telemetry showed values like hs_rate=2.4e-15
+        # and missed_rate=2.3e-28 — mathematically valid exponential
+        # decay (alpha=0.30 ^ ~100 epochs of zero) but practically
+        # meaningless. Worse, the next non-zero sample creates an
+        # enormous EMA jump (1e-15 → ~0.15 in one step) that the
+        # reward function may credit to whichever arm was chosen at
+        # that moment, polluting the bandit. Only applied when the
+        # clamp range is [0.0, X] — bipolar signals like 'reward'
+        # legitimately spend time near zero.
+        if lo == 0.0 and abs(new) < 1e-6:
+            new = 0.0
         self.ema[key] = new
         return new
 
@@ -1171,7 +2056,26 @@ class EnvTune(plugins.Plugin):
         For UNIQUE handshakes, what matters is not just past success — it's
         whether there are CURRENTLY VISIBLE uncaptured APs on this channel.
         That signal dominates over historical data once we have it.
+
+        v1.6 PERF: results are memoised per-epoch in `_ch_score_cache`.
+        `_schedule_channels` calls this O(channels²) (sort + weighted
+        pick + filter), and each call iterates `_known_aps` (~400
+        entries on dense terrain). Without caching that's ~78 k ops per
+        epoch on a Pi Zero 2 W. Cache invalidates automatically on
+        epoch boundary; explicitly invalidate via `_ch_score_cache.clear()`
+        whenever an event handler does something that meaningfully
+        changes scores within the same epoch (handshake, AP visibility
+        flip).
         """
+        # Per-epoch cache. The (epoch, ch) pair is the cache key — when
+        # epoch advances, all entries are stale; we lazy-evict by
+        # checking the epoch counter, not by walking the dict.
+        if self._ch_score_epoch != self.epochs_seen:
+            self._ch_score_cache.clear()
+            self._ch_score_epoch = self.epochs_seen
+        cached = self._ch_score_cache.get(ch)
+        if cached is not None:
+            return cached
         # FIX: take a single locked snapshot of all _ch_lt / _free_channels /
         # _gps_zones / _known_aps state we need; concurrent event-handlers
         # mutate these dicts/lists. After this we work on snapshots only.
@@ -1209,7 +2113,6 @@ class EnvTune(plugins.Plugin):
             # Historical productivity (lifetime stats)
             lt['hs']         * 4.0
           + lt['passive_hs'] * 5.0       # passive captures are FREE — boost
-          + lt['cracked']    * 1.0       # cracked = confirmed weak password area
           - lt['wasted']     * 0.7
           + lt['free_seen']  * 0.3
 
@@ -1229,22 +2132,39 @@ class EnvTune(plugins.Plugin):
         if zone_ch_count:
             score += zone_ch_count * 1.5
 
-        # Channel-efficiency multiplier — telemetry showed the plugin
-        # was over-visiting low-yield channels (ch1: 5% HS/attack rate
-        # over 332 assocs vs ch8: 73% HS/attack rate over 41 assocs).
-        # Once a channel has enough samples to judge it, scale by
-        # success rate so the better channel keeps winning the auction.
-        # Floor 0.5× / cap 1.5× — never zero out the channel entirely.
+        # Channel-efficiency multiplier.
+        #
+        # v1.5 telemetry: ch1 5% HS/attack vs ch8 73% over 41 assocs.
+        # v1.7 community telemetry: across four users, ch7 dominates at
+        #   16.5% HS/attack (97 attempts) but the bandit kept piling
+        #   onto ch1 (970 attempts, 8.1% HS/attack). The old
+        #   `0.5 + eff*3.0` cap 1.5× gave ch7 only ~1.0×, losing to
+        #   ch1's larger absolute base score on raw history.
+        #
+        # New: `0.5 + eff*5.0`, cap 0.4–2.5×. A 16% efficiency channel
+        # now gets 1.30×; a 20% channel gets 1.5×; a 30%+ channel
+        # gets the full 2.0–2.5× boost it deserves.
+        #
+        # Threshold lowered 30 → 20 attempts so genuinely-good but
+        # less-visited channels start being rewarded earlier.
         attempts_lt = lt['assocs'] + lt['deauths']
-        if attempts_lt >= 30:
+        if attempts_lt >= 20:
             eff = lt['hs'] / max(1, attempts_lt)
-            # eff=0.05 → mul=0.65, eff=0.20 → mul=1.10, eff=0.35 → mul=1.45
-            mul = max(0.5, min(1.5, 0.5 + eff * 3.0))
+            # eff=0.05 → 0.75   (slight punishment)
+            # eff=0.10 → 1.00   (break even)
+            # eff=0.16 → 1.30   (community ch7-tier — boost)
+            # eff=0.20 → 1.50
+            # eff=0.30 → 2.00
+            # eff=0.50 → 2.50   (capped — best of the best)
+            mul = max(0.4, min(2.5, 0.5 + eff * 5.0))
             score *= mul
 
         score *= max(0.05, 1.0 - float(self.cfg['dead_ch_lifetime_weight'])
                                  * dead_count)
-        return max(0.0, score)
+        result = max(0.0, score)
+        # Cache for the rest of this epoch.
+        self._ch_score_cache[ch] = result
+        return result
 
     def _pick_weighted(self, pool, n):
         """Weighted random draw without replacement, weighted by score."""
@@ -1265,32 +2185,302 @@ class EnvTune(plugins.Plugin):
                     break
         return picks
 
+    def _resolve_channel_strategy(self):
+        """Return the effective channel strategy string for THIS epoch.
+
+        Modes:
+          - "auto" (default): meta-bandit decides per-block. Returns
+            whichever strategy is currently active in the block.
+          - "adaptive" / "full" / "capped": that exact strategy.
+          - Legacy `respect_full_channels` flag is honoured if
+            channel_strategy is unset: True→"full", False→"capped".
+        """
+        strat = self.cfg.get('channel_strategy')
+        if strat == 'auto':
+            return self._strategy_current or 'adaptive'
+        if strat in ('adaptive', 'full', 'capped'):
+            return strat
+        rfc = self.cfg.get('respect_full_channels')
+        if rfc is True:
+            return 'full'
+        if rfc is False:
+            return 'capped'
+        return 'auto'
+
+    def _strategy_hill_reward(self, uniques, epochs):
+        """Convert (uniques captured in N epochs) → bounded reward [0, 1].
+
+        v2.0 (F-04): target rate is now ADAPTIVE, derived from the
+        same 90th-percentile-of-recent-hpm logic the param bandit uses
+        in `_adaptive_hpm_target`. This fixes a real bug from v1.9
+        where the fixed target=0.5 unique/epoch (≈30/hour) was so
+        high in sparse environments that EVERY block scored ≤ 0.10
+        reward — meaning the bandit couldn't differentiate strategies.
+        Now the target scales with what's achievable in this
+        environment, so the bandit can always learn.
+
+        Conversion: target is in unique/MINUTE (HPM scale) but our
+        block reward is in unique/EPOCH. Convert by assuming epochs
+        approximate to 60s (the pwnagotchi default); deviation up to
+        2× is fine — it just shifts the scoring slightly.
+
+        Hill saturation:
+          rate=0          → 0.0
+          rate=target/2   → 0.33
+          rate=target     → 0.50
+          rate=2×target   → 0.67
+          rate=4×target   → 0.80
+        """
+        if epochs <= 0:
+            return 0.0
+        rate_per_epoch = uniques / epochs
+        # Translate the param-bandit's adaptive HPM target (per minute)
+        # to a per-epoch equivalent. With default ~60s epochs, 1 hpm =
+        # 1 unique per epoch. Floor at 0.05/ep so even sparse-env
+        # bandits can produce non-trivial rewards.
+        adaptive_target_hpm = self._adaptive_hpm_target() or 0.5
+        target = max(0.05, adaptive_target_hpm)
+        if rate_per_epoch <= 0:
+            return 0.0
+        ratio = rate_per_epoch / target
+        return max(0.0, min(1.0, ratio / (ratio + 1.0)))
+
+    def _strategy_bandit_for(self, mobility=None):
+        """Return the per-mobility strategy bandit dict.
+        Defaults to the current mobility. Defensive against unknown
+        mobility values (e.g. legacy 'walking') — falls back to
+        stationary."""
+        m = mobility or self._current_mobility or self.MOBILITY_STATIONARY
+        if m not in self._strategy_bandit:
+            m = self.MOBILITY_STATIONARY
+        return self._strategy_bandit[m]
+
+    def _strategy_ucb_pick(self, mobility=None):
+        """UCB1 over the three strategies WITHIN the given mobility.
+
+        v2.0 (A1): each mobility has its own bandit. The pick uses
+        only that mobility's history.
+
+        v2.2.0: when prefer_stability=True AND mobility=moving, drop
+        'full' from consideration. Walking with a long channel list
+        means more channel hops per minute than the firmware sees on
+        a stationary stock pwnagotchi — exactly the kind of extra
+        load the noai branch was designed to avoid. We still allow
+        capped + adaptive (which preserve the user's channel universe
+        but keep cycle times tight).
+        """
+        bandit = self._strategy_bandit_for(mobility)
+        strats = list(bandit.keys())
+        if (bool(self.cfg.get('prefer_stability', True))
+                and (mobility or self._current_mobility) == self.MOBILITY_MOVING):
+            # Drop 'full' while moving in stability mode — battery + firmware
+            strats = [s for s in strats if s != 'full']
+        # Cold-start: any untried strategy first.
+        untried = [s for s in strats
+                   if bandit[s]['n'] == 0
+                   or len(bandit[s]['rewards']) == 0]
+        if untried:
+            return random.choice(untried)
+        # UCB1 score: mean + c * sqrt(log(N_total) / n_arm)
+        c = float(self.cfg.get('auto_strategy_c', 1.4))
+        total_n = sum(d['n'] for d in (bandit[s] for s in strats))
+        best_score = -math.inf
+        best_strat = strats[0]
+        for s in strats:
+            d = bandit[s]
+            rs = d['rewards']
+            if not rs:
+                continue
+            mean = sum(rs) / len(rs)
+            n = d['n']
+            expl = c * math.sqrt(math.log(max(2, total_n)) / max(1, n))
+            score = mean + expl
+            if score > best_score:
+                best_score = score
+                best_strat = s
+        return best_strat
+
+    def _strategy_block_size_check(self):
+        """Returns True if the current block should end now.
+
+        v2.0 (F-05): primary trigger is wall-clock seconds. Falls back
+        to the legacy epoch-counter if the user explicitly set
+        auto_strategy_block_epochs > 0 (back-compat with v1.9 configs).
+        """
+        epochs_legacy = int(self.cfg.get('auto_strategy_block_epochs', 0) or 0)
+        if epochs_legacy > 0:
+            if self._strategy_block_start_ep is None:
+                return False
+            return (self.epochs_seen - self._strategy_block_start_ep) \
+                >= max(5, epochs_legacy)
+        # Default: wall-clock seconds.
+        secs = max(60, int(self.cfg.get('auto_strategy_block_secs', 1800)))
+        if self._strategy_block_start_mono is None:
+            return False
+        return (time.monotonic() - self._strategy_block_start_mono) >= secs
+
+    def _start_strategy_block(self, log_prefix='starting'):
+        """Begin a fresh block under the current mobility's bandit."""
+        mobility = self._current_mobility or self.MOBILITY_STATIONARY
+        next_strat = self._strategy_ucb_pick(mobility)
+        self._strategy_current          = next_strat
+        self._strategy_block_start_ep   = self.epochs_seen
+        self._strategy_block_start_mono = time.monotonic()
+        self._strategy_block_mobility   = mobility
+        self._uniques_at_block_start    = self._lifetime_new_count
+        epochs_legacy = int(self.cfg.get('auto_strategy_block_epochs', 0) or 0)
+        if epochs_legacy > 0:
+            duration_s = f'{epochs_legacy} epochs'
+        else:
+            secs = int(self.cfg.get('auto_strategy_block_secs', 1800))
+            duration_s = f'{secs}s'
+        log.info(f'[envtune] auto-strategy: {log_prefix} block under '
+                 f'mobility={mobility} → {next_strat} ({duration_s})')
+
+    def _maybe_advance_strategy_block(self):
+        """Called each epoch in `on_epoch`. If channel_strategy='auto'
+        and the block has expired, score it under the mobility it ran
+        in and pick the next block's strategy under the CURRENT
+        mobility (which may have changed)."""
+        if self.cfg.get('channel_strategy') != 'auto':
+            return
+        # First-ever invocation
+        if self._strategy_current is None:
+            self._start_strategy_block(log_prefix='starting')
+            return
+        # Block still in progress
+        if not self._strategy_block_size_check():
+            return
+        # Block finished — score under the mobility it ran in.
+        block_mobility = (self._strategy_block_mobility
+                          or self.MOBILITY_STATIONARY)
+        epochs_in_block = max(1,
+            self.epochs_seen - (self._strategy_block_start_ep or self.epochs_seen))
+        uniques_this_block = max(
+            0, self._lifetime_new_count - self._uniques_at_block_start)
+        reward = self._strategy_hill_reward(uniques_this_block, epochs_in_block)
+        prev_strat = self._strategy_current
+        bandit = self._strategy_bandit_for(block_mobility)
+        d = bandit.setdefault(
+            prev_strat, {'n': 0, 'rewards': deque(maxlen=20)})
+        d['n'] += 1
+        d['rewards'].append(reward)
+        log.info(
+            f'[envtune] auto-strategy block done: {prev_strat}@'
+            f'{block_mobility} → {uniques_this_block} unique HS in '
+            f'{epochs_in_block} ep (reward={reward:.3f})')
+        # Start next block under CURRENT mobility (may differ from the
+        # block we just scored).
+        self._start_strategy_block(log_prefix='next')
+
+    def _abort_strategy_block(self, reason):
+        """v2.0 (F-06): drop the in-progress block without scoring it.
+        Used on location change — the block ran in a now-stale
+        environment, scoring it would credit the wrong mobility's
+        bandit. Next epoch will start a clean block."""
+        if self._strategy_current is None:
+            return
+        log.info(
+            f'[envtune] auto-strategy: aborting block ({reason}) — '
+            f'in-progress {self._strategy_current}@'
+            f'{self._strategy_block_mobility}')
+        self._strategy_current          = None
+        self._strategy_block_start_ep   = None
+        self._strategy_block_start_mono = None
+        self._strategy_block_mobility   = None
+
     def _schedule_channels(self, agent):
-        """Build the next scan channel list (dedup, score-sorted)."""
+        """Build the next scan channel list.
+
+        v1.8.0 dispatches by `channel_strategy`:
+          - "adaptive" (default): top-K capped most epochs, full sweep
+            every channel_full_sweep_every epochs. Best total HS yield.
+          - "full":  scan whole universe every epoch.
+          - "capped": legacy top-K, no sweeps.
+
+        All modes are bounded by `_user_channels_orig` — channels
+        outside the user's config never appear, channels inside it
+        are never permanently dropped (full + adaptive guarantee at
+        least one full visit per sweep period).
+        """
         try:
             n_extra = int(self._profile['extra_channels'])
 
-            if not self._unscanned_channels:
-                if 'restrict_channels' in self.cfg:
-                    pool = list(self.cfg['restrict_channels'])
-                elif hasattr(agent, '_allowed_channels') and agent._allowed_channels:
-                    pool = list(agent._allowed_channels)
-                elif hasattr(agent, '_supported_channels') and agent._supported_channels:
-                    pool = list(agent._supported_channels)
-                else:
-                    try:
-                        pool = pwnagotchi.utils.iface_channels(
-                            agent._config['main']['iface'])
-                    except Exception:
-                        pool = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-                self._unscanned_channels = pool
+            # User universe — captured once in on_ready. Falls back if
+            # something went sideways during startup capture.
+            universe = self._user_channels_orig
+            if not universe:
+                universe = list(range(1, 12))
 
+            with self._state_lock:
+                if not self._unscanned_channels:
+                    # Restrict_channels (envtune-specific override) wins
+                    # if present, else use the user universe.
+                    if 'restrict_channels' in self.cfg:
+                        pool = list(self.cfg['restrict_channels'])
+                    else:
+                        pool = list(universe)
+                    self._unscanned_channels = [c for c in pool
+                                                if c in universe]
+                # Snapshot — work on copies from here on to avoid races
+                # with on_wifi_update / on_bcap_wifi_ap_lost.
+                unscanned_snap     = [c for c in self._unscanned_channels
+                                      if c in universe]
+                active_snap        = [c for c in self._active_channels
+                                      if c in universe]
+                dead_session_snap  = dict(self._dead_session)
+
+            strategy = self._resolve_channel_strategy()
+
+            # Decide if THIS epoch is a full-universe sweep:
+            # - "full" mode: every epoch is a sweep
+            # - "adaptive" mode: every channel_full_sweep_every epochs
+            # - "capped" mode: never
+            sweep_every = max(2, int(self.cfg.get(
+                'channel_full_sweep_every', 15)))
+            is_sweep_epoch = (
+                strategy == 'full' or (
+                    strategy == 'adaptive'
+                    and self.epochs_seen > 0
+                    and (self.epochs_seen - self._last_full_sweep_ep)
+                        >= sweep_every))
+
+            if is_sweep_epoch:
+                ranked = sorted(universe, key=lambda c: -self._ch_score(c))
+                if strategy == 'adaptive':
+                    self._last_full_sweep_ep = self.epochs_seen
+                    log.info(
+                        f'[envtune] adaptive full sweep '
+                        f'({len(ranked)} channels) '
+                        f'— next in {sweep_every} epochs')
+                else:
+                    # v2.0 (F-15): the long-cycle warning fires only
+                    # when the user EXPLICITLY set channel_strategy="full"
+                    # — not on auto-mode's periodic full-sweep blocks
+                    # (which were generating false-alarm warnings).
+                    cfg_mode = self.cfg.get('channel_strategy')
+                    if cfg_mode == 'full' and self.epochs_seen % 50 == 1:
+                        personality = agent._config.get('personality', {})
+                        hrt = max(1.0, _sf(personality.get('hop_recon_time', 8)))
+                        cycle_secs = len(ranked) * hrt
+                        if cycle_secs > 120:
+                            log.info(
+                                f'[envtune] strategy=full: scanning all '
+                                f'{len(ranked)} channels each epoch '
+                                f'(~{cycle_secs:.0f}s recon cycle). '
+                                f'Consider channel_strategy="auto" or '
+                                f'"adaptive" for higher HS yield.')
+                agent._config['personality']['channels'] = ranked
+                return
+
+            # CAPPED PATH (also adaptive non-sweep epochs).
             cdl       = int(self.cfg['dead_channel_cooldown'])
-            available = [c for c in self._unscanned_channels
-                         if self._dead_session.get(c, 0) < cdl]
+            available = [c for c in unscanned_snap
+                         if dead_session_snap.get(c, 0) < cdl]
             if not available:
-                self._dead_session.clear()
-                available = list(self._unscanned_channels)
+                with self._state_lock:
+                    self._dead_session.clear()
+                available = list(unscanned_snap)
 
             pw     = float(self.cfg['priority_channel_weight'])
             n_prio = max(1, int(round(n_extra * pw))) if n_extra > 0 else 0
@@ -1306,44 +2496,60 @@ class EnvTune(plugins.Plugin):
                           if expl_pool else [])
 
             # Build score-sorted, deduplicated channel list
-            all_candidates = set(self._active_channels) | set(prio_picks) | set(expl_picks)
+            all_candidates = set(active_snap) | set(prio_picks) | set(expl_picks)
             next_chs = sorted(
                 all_candidates,
                 key=lambda c: -self._ch_score(c),
             )
 
             # CRITICAL: cap total channels to prevent recon stalls in dense
-            # environments. Each channel gets ~hop_recon_time seconds. If we
-            # have 15 channels in the list with hop_recon_time=10, that's
-            # 2.5 minutes per recon cycle = lots of missed handshakes.
-            # Cap = base_active(max 6) + extra_channels.
+            # environments. Each channel gets ~hop_recon_time seconds, so
+            # one full cycle ≈ N_channels × hop_recon_time. We want a
+            # cycle bounded to ~`target_cycle_secs` (default 75 s) so a
+            # freshly-arriving client doesn't sit on a channel we haven't
+            # visited for minutes. v1.4.1 fix — earlier versions computed
+            # `hrt` but never used it, so the cap was static.
             personality = agent._config.get('personality', {})
-            hrt = _sf(personality.get('hop_recon_time', 8))
-            # Calculate sane max so one full recon cycle is bounded
-            # to ~60-90 seconds even at high hrt
-            max_active_in_list = min(6, len(self._active_channels))
-            max_total = max_active_in_list + n_extra
+            hrt = max(1.0, _sf(personality.get('hop_recon_time', 8)))
+            target_cycle_secs = float(self.cfg.get('target_recon_cycle_secs', 75))
+            hrt_max   = max(3, int(target_cycle_secs / hrt))
+            must_have = len(active_snap)
+            # v1.7.1: cap can never go BELOW the user's configured
+            # channel universe size. If the user explicitly listed 30
+            # channels in personality.channels, we honour that (even
+            # in legacy capped mode — the cap only applies to bandit
+            # ADDITIONS beyond the user's list, not to the user's list
+            # itself). The 14-channel hard cap is also lifted to match
+            # the user's universe so 5 GHz channel sets aren't truncated.
+            user_n = len(universe)
+            max_total = max(
+                user_n,                                       # honour user
+                min(must_have + n_extra,
+                    max(must_have, hrt_max),
+                    max(14, user_n)))
 
             # Identify channels with strong, attackable, uncaptured APs.
             # These MUST stay in the list even if score-cap would drop them —
             # losing such a channel = guaranteed missed unique handshake.
             must_keep = set()
             with self._state_lock:
-                for ap in list(self._known_aps.values()):
-                    if not ap.get('AT_visible'):
-                        continue
-                    if ap.get('AT_already_captured'):
-                        continue
-                    if ap.get('AT_pmf_detected'):
-                        continue
-                    if ap.get('AT_cooldown_until', 0) > self.epochs_seen:
-                        continue
-                    if _sf(ap.get('rssi', -100)) <= -75:
-                        continue
-                    ch = _si(ap.get('channel', 0))
-                    if ch:
-                        must_keep.add(ch)
+                aps_snap_local = list(self._known_aps.values())
+            for ap in aps_snap_local:
+                if not ap.get('AT_visible'):
+                    continue
+                if ap.get('AT_already_captured'):
+                    continue
+                if ap.get('AT_pmf_detected'):
+                    continue
+                if ap.get('AT_cooldown_until', 0) > self.epochs_seen:
+                    continue
+                if _sf(ap.get('rssi', -100)) <= -75:
+                    continue
+                ch = _si(ap.get('channel', 0))
+                if ch:
+                    must_keep.add(ch)
 
+            dropped = []
             if len(next_chs) > max_total:
                 # Keep top max_total by score, then add must_keep channels
                 # that didn't make the cap (force-included)
@@ -1352,21 +2558,36 @@ class EnvTune(plugins.Plugin):
                 final         = top_keep + forced_extras
                 dropped       = [c for c in next_chs if c not in final]
                 next_chs      = final
-                # Push dropped channels back to unscanned for next cycle
-                for ch in dropped:
-                    if ch not in self._unscanned_channels and ch not in next_chs:
-                        self._unscanned_channels.append(ch)
 
-            # Remove used extras from unscanned pool
-            for ch in prio_picks + expl_picks:
-                if ch in self._unscanned_channels and ch in next_chs:
-                    self._unscanned_channels.remove(ch)
+            # Reconcile unscanned-pool mutations under lock at the end —
+            # one write transaction instead of mid-loop list.remove racing
+            # with on_wifi_update.
+            with self._state_lock:
+                for ch in dropped:
+                    if (ch not in self._unscanned_channels
+                            and ch not in next_chs):
+                        self._unscanned_channels.append(ch)
+                for ch in prio_picks + expl_picks:
+                    if (ch in self._unscanned_channels
+                            and ch in next_chs):
+                        self._unscanned_channels.remove(ch)
+
+            # In LEGACY "capped" mode we never want to silently drop a
+            # user-configured channel. Adaptive non-sweep epochs are
+            # explicitly allowed to (their full sweep refreshes the
+            # missed channels every channel_full_sweep_every epochs).
+            if strategy == 'capped':
+                present = set(next_chs)
+                for ch in universe:
+                    if ch not in present:
+                        next_chs.append(ch)
 
             agent._config['personality']['channels'] = next_chs
             # Note: channel set is applied by pwnagotchi's recon loop
             # via `wifi.recon.channel` — no manual sync needed.
         except Exception as e:
-            logging.exception(f'[envtune] _schedule_channels: {e}')
+            self._record_error('_schedule_channels')
+            log.exception(f'[envtune] _schedule_channels: {e}')
 
     # ─────────────────────────────────────────────────────────────────────
     # AP tracking (thread-safe via _state_lock on public entry points)
@@ -1476,7 +2697,7 @@ class EnvTune(plugins.Plugin):
                 self._known_aps[apID]['AT_lastseen'] = time.monotonic()
 
         except Exception as e:
-            logging.debug(f'[envtune] _mark_ap_seen: {e}')
+            log.debug(f'[envtune] _mark_ap_seen: {e}')
 
     def _evict_oldest_ap(self):
         """Remove the lowest-value AP entry to stay under cap.
@@ -1592,8 +2813,20 @@ class EnvTune(plugins.Plugin):
                 score += 1.5 * (1.0 - age / 8.0)
 
         score += ap.get('AT_efficiency', 0.0) * 3.0
+        # v1.6 algorithmic upgrade: RSSI is logarithmic (dB scale), but
+        # the v1.5 formula `(rssi + 65)/20` weighted it linearly. Effect:
+        # an AP at -50 dBm got weight 0.75; an AP at -65 dBm got weight
+        # 0.0. In reality the -50 dBm AP succeeds *vastly* more often
+        # than -65 dBm — handshake success roughly doubles every 6 dB.
+        # Geometric weighting captures this:
+        #   rssi=-85 → ~0.06    (weak — barely worth attacking)
+        #   rssi=-75 → ~0.25
+        #   rssi=-65 → ~1.00
+        #   rssi=-55 → ~4.00    (very strong — prioritise heavily)
+        # Capped at 5.0 so a -45 dBm super-strong AP doesn't overwhelm
+        # client-presence signals (which are independently scored above).
         rssi   = _sf(ap.get('rssi', -85))
-        score += max(0.0, (rssi + 65.0) / 20.0)
+        score += min(5.0, 2 ** ((rssi + 75.0) / 6.0))
         score += self._rssi_trend(apID) * 0.4
 
         if ap.get('AT_pmf_detected', False) and not ap.get('AT_pmkid_success', False):
@@ -1619,6 +2852,21 @@ class EnvTune(plugins.Plugin):
         aa       = self._chistos['_all_actions']
         aa[ch]   = aa.get(ch, 0) + abs(count)
         aa[-1]   = aa.get(-1, 0) + abs(count)
+        # v2.0 (F-13): cap _chistos to bound long-session memory growth.
+        # Eviction: in '_all_actions' (the union counter), drop the
+        # least-active channel(s) and propagate to all sub-stats.
+        # Cheap — only fires when over cap, walks _all_actions once.
+        max_ch = int(self.cfg.get('chistos_max_channels', 200))
+        if max_ch > 0 and len(aa) - 1 > max_ch:  # -1 for the '-1' total key
+            # Find the least-active channels (excluding -1 total)
+            channels_by_activity = sorted(
+                ((c, n) for c, n in aa.items() if c != -1),
+                key=lambda kv: kv[1])
+            evict_count = (len(aa) - 1) - max_ch
+            for c, _n in channels_by_activity[:evict_count]:
+                # Drop from _all_actions and every sub-stat
+                for sub in self._chistos.values():
+                    sub.pop(c, None)
 
     # ─────────────────────────────────────────────────────────────────────
     # Nexmon crash detection (uses pre-epoch-update EMA)
@@ -1764,7 +3012,7 @@ class EnvTune(plugins.Plugin):
                     return None
 
         except Exception as e:
-            logging.debug(f'[envtune] _read_gps: {e}')
+            log.debug(f'[envtune] _read_gps: {e}')
 
         return None
 
@@ -1864,8 +3112,9 @@ class EnvTune(plugins.Plugin):
                 and _si(p.get('max_interactions', 3)) > 4):
             p['max_interactions'] = 4
 
-        # 6) In mobile mode, long TTLs waste memory on out-of-range APs
-        if self._current_mobility == self.MOBILITY_MOBILE:
+        # 6) When moving, long TTLs waste memory on out-of-range APs.
+        # v4 schema: covers walking + driving (mobility 2-way).
+        if self._current_mobility == self.MOBILITY_MOVING:
             if _sf(p.get('ap_ttl', 120)) > 180:
                 p['ap_ttl'] = 180
             if _sf(p.get('sta_ttl', 300)) > 300:
@@ -1911,12 +3160,22 @@ class EnvTune(plugins.Plugin):
             if _si(p.get('max_interactions', 3)) > 4:
                 p['max_interactions'] = 4
 
-        # 14) Low battery: reduce aggression
+        # 14) Low battery: graduated response.
+        # v2.2: battery_low_threshold (default 20%) triggers a milder
+        # cap — keep max_interactions <= 4 and slightly slower throttle.
+        # battery_critical_threshold (default 10%) triggers the harder
+        # cap (max_interactions=2, throttle_d>=0.9).
         if self._battery_level is not None:
-            if self._battery_level < self.cfg['battery_critical_threshold']:
+            crit = float(self.cfg.get('battery_critical_threshold', 10.0))
+            low  = float(self.cfg.get('battery_low_threshold', 20.0))
+            if self._battery_level < crit:
                 p['max_interactions'] = min(_si(p.get('max_interactions', 3)), 2)
                 if 'throttle_d' in self._active_params:
                     p['throttle_d'] = max(_sf(p.get('throttle_d', 0.9)), 0.9)
+            elif self._battery_level < low:
+                p['max_interactions'] = min(_si(p.get('max_interactions', 3)), 4)
+                if 'throttle_d' in self._active_params:
+                    p['throttle_d'] = max(_sf(p.get('throttle_d', 0.9)), 0.7)
 
         # 15) Sad/bored mood: longer TTLs to catch slow activity
         if self._mood in ('sad', 'bored'):
@@ -1972,7 +3231,7 @@ class EnvTune(plugins.Plugin):
             # crediting them with rewards from the boost period would
             # reinforce the very arms we want to escape. Drop the queue.
             self._decision_buffer.clear()
-            logging.info(f'[envtune] Stagnation → '
+            log.info(f'[envtune] Stagnation → '
                          f'{self._exploration_boost}-ep exploration boost')
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1980,9 +3239,25 @@ class EnvTune(plugins.Plugin):
     # ─────────────────────────────────────────────────────────────────────
 
     def _apply_thermal_throttle(self, agent, temp):
-        """Back off radio work when CPU temperature climbs."""
+        """Back off radio work when CPU temperature climbs.
+
+        v2.0 (F-08): on RECOVERY (temp drops below temp_warn), restore
+        the parameter values that were in effect before throttling
+        kicked in. v1.9 left the elevated values (throttle_d=0.9 etc.)
+        in place until the next UCB select cycle, leaving the radio
+        unnecessarily quiet for several minutes after thermal recovery.
+        """
         p = agent._config['personality']
+        was_throttled = self._thermal_throttle
         if temp >= self.cfg['temp_critical']:
+            if not was_throttled:
+                # First time entering throttle — snapshot current params
+                # so we can restore them on recovery.
+                self._thermal_saved_params = {
+                    k: p.get(k) for k in
+                    ('throttle_d', 'throttle_a', 'max_interactions')
+                    if k in p
+                }
             self._thermal_throttle = True
             if 'throttle_d' in self._active_params:
                 p['throttle_d'] = min(self.BOUNDS['throttle_d'][1],
@@ -1991,13 +3266,30 @@ class EnvTune(plugins.Plugin):
                 p['throttle_a'] = min(self.BOUNDS['throttle_a'][1],
                                       _sf(p.get('throttle_a', 0.4)) + 0.2)
             p['max_interactions'] = max(2, _si(p.get('max_interactions', 3)) - 1)
-            logging.warning(f'[envtune] THERMAL CRITICAL {temp:.1f}°C — throttling')
+            log.warning(f'[envtune] THERMAL CRITICAL {temp:.1f}°C — throttling')
         elif temp >= self.cfg['temp_warn']:
+            if not was_throttled:
+                self._thermal_saved_params = {
+                    k: p.get(k) for k in
+                    ('throttle_d', 'throttle_a', 'max_interactions')
+                    if k in p
+                }
             self._thermal_throttle = True
             if 'throttle_d' in self._active_params:
                 p['throttle_d'] = max(_sf(p.get('throttle_d', 0.9)), 0.9)
-            logging.info(f'[envtune] Thermal warning {temp:.1f}°C')
+            log.info(f'[envtune] Thermal warning {temp:.1f}°C')
         else:
+            # Temperature has recovered. If we were throttled, restore
+            # the params we saved BEFORE the throttle pushed them up.
+            # The bandit's next UCB select will then refine from a
+            # clean baseline rather than from elevated throttle values.
+            if was_throttled and getattr(self, '_thermal_saved_params', None):
+                for k, v in self._thermal_saved_params.items():
+                    if v is not None:
+                        p[k] = v
+                self._thermal_saved_params = None
+                log.info(f'[envtune] thermal recovery {temp:.1f}°C — '
+                         f'restored pre-throttle params')
             self._thermal_throttle = False
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2033,9 +3325,9 @@ class EnvTune(plugins.Plugin):
         if not self.cfg.get('enable_wpasec_feedback', True):
             return cracked
         try:
-            if not os.path.exists(self.WPASEC_POT):
+            if not os.path.exists(self._wpasec_pot):
                 return cracked
-            with open(self.WPASEC_POT, 'r', errors='ignore') as f:
+            with open(self._wpasec_pot, 'r', errors='ignore') as f:
                 for line in f:
                     line = line.strip()
                     if not line or ':' not in line:
@@ -2046,7 +3338,7 @@ class EnvTune(plugins.Plugin):
                         if len(mac) == 12 and all(c in '0123456789abcdef' for c in mac):
                             cracked.add(mac)
         except Exception as e:
-            logging.debug(f'[envtune] potfile scan: {e}')
+            log.debug(f'[envtune] potfile scan: {e}')
         return cracked
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2072,12 +3364,12 @@ class EnvTune(plugins.Plugin):
                 # Otherwise treat as SSID
                 self._whitelist_ssids.add(s)
             if self._whitelist_macs or self._whitelist_ssids:
-                logging.info(
+                log.info(
                     f'[envtune] Whitelist loaded: '
                     f'{len(self._whitelist_macs)} MACs, '
                     f'{len(self._whitelist_ssids)} SSIDs')
         except Exception as e:
-            logging.debug(f'[envtune] whitelist load: {e}')
+            log.debug(f'[envtune] whitelist load: {e}')
 
     # ─────────────────────────────────────────────────────────────────────
     # Handshake directory scan
@@ -2090,9 +3382,9 @@ class EnvTune(plugins.Plugin):
         """
         captured = set()
         try:
-            if not os.path.isdir(self.HANDSHAKE_DIR):
+            if not os.path.isdir(self._hs_dir):
                 return captured
-            for fn in os.listdir(self.HANDSHAKE_DIR):
+            for fn in os.listdir(self._hs_dir):
                 if not fn.endswith(('.pcap', '.pcapng')):
                     continue
                 stem  = fn.rsplit('.', 1)[0]
@@ -2103,7 +3395,7 @@ class EnvTune(plugins.Plugin):
                 if len(mac) == 12 and all(c in '0123456789abcdef' for c in mac):
                     captured.add(mac)
         except Exception as e:
-            logging.debug(f'[envtune] handshake dir scan: {e}')
+            log.debug(f'[envtune] handshake dir scan: {e}')
         return captured
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2123,7 +3415,7 @@ class EnvTune(plugins.Plugin):
             try:
                 agent.run(f'set {bcap_key} {new_val}')
             except Exception as e:
-                logging.debug(f'[envtune] bcap sync {bcap_key}={new_val}: {e}')
+                log.debug(f'[envtune] bcap sync {bcap_key}={new_val}: {e}')
 
     def _push_bcap_skip_list(self, agent, force=False):
         """
@@ -2169,17 +3461,17 @@ class EnvTune(plugins.Plugin):
                 skip_list = ','.join(sorted(new_set))
                 agent.run(f'set wifi.assoc.skip {skip_list}')
                 agent.run(f'set wifi.deauth.skip {skip_list}')
-                logging.debug(f'[envtune] pushed {n} BSSIDs to bcap skip-list '
+                log.debug(f'[envtune] pushed {n} BSSIDs to bcap skip-list '
                               f'(cracked={skip_cracked}, '
                               f'captured={skip_captured})')
             else:
                 # Actively clear stale skip rules from a previous run.
                 agent.run('set wifi.assoc.skip ')
                 agent.run('set wifi.deauth.skip ')
-                logging.debug('[envtune] cleared bcap skip-list')
+                log.debug('[envtune] cleared bcap skip-list')
             self._bcap_skip_pushed_count = n
         except Exception as e:
-            logging.debug(f'[envtune] bcap skip-list push: {e}')
+            log.debug(f'[envtune] bcap skip-list push: {e}')
 
     # ─────────────────────────────────────────────────────────────────────
     # Detect which params this fork exposes (graceful for evilsocket)
@@ -2191,11 +3483,11 @@ class EnvTune(plugins.Plugin):
             supported = {k for k in self.UCB_ARMS if k in p}
             missing   = set(self.UCB_ARMS.keys()) - supported
             if missing:
-                logging.info(f'[envtune] Fork missing params: {sorted(missing)} '
+                log.info(f'[envtune] Fork missing params: {sorted(missing)} '
                              f'— those UCB arms will be skipped')
             self._active_params = supported
         except Exception as e:
-            logging.warning(f'[envtune] param detection fallback: {e}')
+            log.warning(f'[envtune] param detection fallback: {e}')
             self._active_params = set(self.UCB_ARMS.keys())
 
     # ─────────────────────────────────────────────────────────────────────
@@ -2226,7 +3518,7 @@ class EnvTune(plugins.Plugin):
                     continue
                 lo, hi = self.EMA_CLAMP.get(k, (-1e9, 1e9))
                 if fv < lo or fv > hi:
-                    logging.warning(
+                    log.warning(
                         f'[envtune] dropped corrupt EMA {k}={fv} '
                         f'(outside [{lo}, {hi}])')
                     continue
@@ -2237,6 +3529,76 @@ class EnvTune(plugins.Plugin):
             self._reward_trend    = 0.0
             self.lifetime_handshakes = _si(st.get('lifetime_handshakes', 0))
             self._lifetime_new_count = _si(st.get('lifetime_new_count', 0))
+
+            # v1.6: restore rolling reward/HPM history. Each list is
+            # tail-truncated to the deque maxlen (60) and validated as
+            # finite floats — a corrupted entry (NaN, str) is dropped
+            # rather than poisoning the percentile/median computations.
+            for src_key, dest in (
+                ('recent_hpm',     self._recent_hpm),
+                ('reward_history', self._reward_history),
+            ):
+                raw = st.get(src_key) or []
+                if isinstance(raw, list):
+                    for v in raw[-dest.maxlen:]:
+                        fv = _sf(v, default=None) if v is not None else None
+                        if fv is not None and math.isfinite(fv):
+                            dest.append(fv)
+
+            # v2.0 (A1): restore mobility-aware strategy meta-bandit.
+            # Migrates from v1.9 flat-schema state automatically.
+            # Schema-tolerant: unknown mobilities/strategies are ignored.
+            sb_raw = st.get('strategy_bandit') or {}
+            sb_schema = st.get('strategy_bandit_schema') or ''
+            if isinstance(sb_raw, dict) and sb_raw:
+                # Detect format: v1.9 has 'adaptive'/'full'/'capped' as
+                # top-level keys; v2.0 has 'stationary'/'moving' as top-
+                # level keys (each containing the strategy dict).
+                v19_keys = {'adaptive', 'full', 'capped'}
+                v20_keys = {self.MOBILITY_STATIONARY, self.MOBILITY_MOVING}
+                top_keys = set(sb_raw.keys())
+                is_v20 = (sb_schema == 'mobility_aware_v2'
+                          or top_keys & v20_keys)
+                is_v19 = (top_keys & v19_keys) and not is_v20
+
+                def _ingest_strategy_dict(target_mob, src):
+                    """Pull strategy stats from src dict into the
+                    target mobility's bandit cells."""
+                    for s, d in src.items():
+                        if s not in self._strategy_bandit[target_mob]:
+                            continue
+                        if not isinstance(d, dict):
+                            continue
+                        n = _si(d.get('n', 0))
+                        rs = d.get('rewards') or []
+                        if not isinstance(rs, list):
+                            continue
+                        clean = []
+                        for r in rs:
+                            fr = _sf(r, default=None) if r is not None else None
+                            if fr is not None and math.isfinite(fr):
+                                clean.append(max(0.0, min(1.0, fr)))
+                        if n > 0 and clean:
+                            self._strategy_bandit[target_mob][s]['n'] = n
+                            for r in clean[-20:]:
+                                self._strategy_bandit[target_mob][s]['rewards'].append(r)
+
+                if is_v20:
+                    for mobility, mob_dict in sb_raw.items():
+                        if mobility not in self._strategy_bandit:
+                            continue
+                        if not isinstance(mob_dict, dict):
+                            continue
+                        _ingest_strategy_dict(mobility, mob_dict)
+                elif is_v19:
+                    # v1.9 → v2.0 migration: seed BOTH mobilities with
+                    # the v1.9 stats. The bandit then differentiates as
+                    # new mobility-specific data arrives.
+                    log.info(
+                        '[envtune] migrating v1.9 strategy bandit '
+                        '→ v2.0 mobility-aware schema')
+                    for mobility in self._strategy_bandit:
+                        _ingest_strategy_dict(mobility, sb_raw)
 
             # Restore captured-BSSID set. Without this, lifetime_new_count
             # could desync from disk-state (deleted pcaps) and re-counting
@@ -2289,15 +3651,113 @@ class EnvTune(plugins.Plugin):
                 self._deserialise_ucb(raw_ucb, loaded_schema)
 
             if loaded_schema < self.STATE_SCHEMA_VERSION:
-                logging.info(
+                log.info(
                     f'[envtune] State migrated from schema v{loaded_schema} '
                     f'to v{self.STATE_SCHEMA_VERSION}')
 
-            logging.info(
+            log.info(
                 f'[envtune] State loaded — lifetime_hs={self.lifetime_handshakes} '
                 f'zones={len(self._gps_zones)} best_rwd={self.best_reward}')
         except Exception as e:
-            logging.warning(f'[envtune] State load failed: {e} — starting fresh')
+            log.warning(f'[envtune] State load failed: {e} — starting fresh')
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Community priors — merge anonymised exports from other operators
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _merge_community_priors(self):
+        """
+        Scan COMMUNITY_PRIORS_DIR and merge anonymised export JSON files
+        into the local UCB table at low weight.
+
+        For each (param, state, arm) seen across community files we
+        append at most `cap` reward samples drawn from that arm's
+        community history, capped so a single operator's export can't
+        dominate. Schema migration is delegated to `_deserialise_ucb`,
+        so v3 (108-state) and v4 (24-state) exports both work.
+
+        v1.8.1 — defensive against accidentally-uploaded non-anon
+        exports: we ONLY read `ucb_table`. Even if an export contains
+        captured_bssids / cracked_bssids / gps_zones, we ignore those
+        — community priors should never ingest someone else's BSSIDs
+        (privacy: WiGLE-geolocatable) or zone data (location-revealing).
+
+        Only fired ONCE on plugin load; the merged samples roll out of
+        the local sliding window naturally as real data arrives.
+        Returns (files_merged, total_samples_merged, errors).
+        """
+        if not os.path.isdir(self.COMMUNITY_PRIORS_DIR):
+            return 0, 0, 0
+        cap = 5     # at most 5 imported samples per (state, arm, file)
+        files_n     = 0
+        samples_n   = 0
+        errors_n    = 0
+        try:
+            entries = sorted(os.listdir(self.COMMUNITY_PRIORS_DIR))
+        except OSError:
+            return 0, 0, 0
+        for fn in entries:
+            if not fn.lower().endswith('.json'):
+                continue
+            path = os.path.join(self.COMMUNITY_PRIORS_DIR, fn)
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    data = json.load(fh)
+            except Exception as e:
+                log.warning(
+                    f'[envtune] community prior {fn} unreadable: {e}')
+                errors_n += 1
+                continue
+            schema = _si(data.get('schema_version', 1))
+            ucb    = data.get('ucb_table') or {}
+            if not isinstance(ucb, dict) or not ucb:
+                continue
+            for param, states in ucb.items():
+                if param not in self.UCB_ARMS:
+                    continue
+                if not isinstance(states, dict):
+                    continue
+                for old_state, arms in states.items():
+                    if not isinstance(arms, dict):
+                        continue
+                    new_state = self._migrate_state_key(old_state, schema)
+                    self._ensure_state(param, new_state)
+                    for arm_s, info in arms.items():
+                        if not isinstance(info, dict):
+                            continue
+                        try:
+                            ref_type = type(self.UCB_ARMS[param][0])
+                            arm = ref_type(arm_s)
+                        except (ValueError, TypeError):
+                            try:
+                                arm = float(arm_s)
+                            except (ValueError, TypeError):
+                                continue
+                        if arm not in self.ucb_table[param][new_state]:
+                            continue
+                        rewards = info.get('rewards') or []
+                        if not rewards:
+                            continue
+                        # Keep only the most-recent `cap` rewards from
+                        # this file. Validate finite floats. Then mix
+                        # in: 60% community signal, 40% neutral 0.30.
+                        # This dampens community pull so it shouldn't
+                        # override local learning once real data flows.
+                        clean = []
+                        for r in rewards[-cap:]:
+                            fr = _sf(r, default=None) if r is not None else None
+                            if fr is not None and math.isfinite(fr):
+                                clean.append(0.6 * max(0.0, min(1.0, fr))
+                                             + 0.4 * 0.30)
+                        if not clean:
+                            continue
+                        entry = self.ucb_table[param][new_state][arm]
+                        for r in clean:
+                            entry['rewards'].append(r)
+                        entry['n'] += len(clean)
+                        samples_n += len(clean)
+            files_n += 1
+        return files_n, samples_n, errors_n
 
     def _build_state_snapshot(self):
         """Build a full state dict under the lock, return it for async write."""
@@ -2308,6 +3768,24 @@ class EnvTune(plugins.Plugin):
                 'ema':                 dict(self.ema),
                 'lifetime_handshakes': self.lifetime_handshakes,
                 'lifetime_new_count':  self._lifetime_new_count,
+                # v1.6: persist rolling reward / HPM history so the
+                # adaptive target doesn't reset to the 0.5/min floor for
+                # ~10 epochs every restart. Stored as plain lists; the
+                # loader puts them back into a deque(maxlen=60).
+                'recent_hpm':          list(self._recent_hpm),
+                'reward_history':      list(self._reward_history),
+                # v2.0 (A1): mobility-aware strategy meta-bandit. Persisted
+                # as nested dict: {mobility: {strategy: {n, rewards}}}.
+                # v1.9 flat schema is auto-migrated on load. Block
+                # progress is session-only — clean restart on reboot.
+                'strategy_bandit': {
+                    mobility: {
+                        s: {'n': d['n'], 'rewards': list(d['rewards'])}
+                        for s, d in mob_bandit.items()
+                    }
+                    for mobility, mob_bandit in self._strategy_bandit.items()
+                },
+                'strategy_bandit_schema': 'mobility_aware_v2',
                 'captured_bssids':     sorted(self._captured_bssids),
                 'cracked_bssids':      sorted(self._cracked_bssids),
                 'ch_lt':   {str(k): dict(v) for k, v in self._ch_lt.items()},
@@ -2329,7 +3807,13 @@ class EnvTune(plugins.Plugin):
             }
 
     def _save_worker(self):
-        """Background thread: drain save queue, coalesce rapid requests."""
+        """Background thread: drain save queue, coalesce rapid requests.
+
+        v1.6 fix: a None sentinel arriving DURING coalesce no longer
+        causes the latest already-drained snapshot to be lost. We now
+        always write the most-recent non-None snapshot before honouring
+        the shutdown sentinel.
+        """
         while not self._save_stop.is_set():
             try:
                 snapshot = self._save_queue.get(timeout=1.0)
@@ -2337,19 +3821,32 @@ class EnvTune(plugins.Plugin):
                 continue
             if snapshot is None:
                 break
-            # Drain additional queued snapshots — only keep the latest
+            # Drain additional queued snapshots — only keep the latest.
+            # If we see a None during drain, remember to stop, but still
+            # write the latest real snapshot first.
+            stop_after_write = False
             while True:
                 try:
-                    snapshot = self._save_queue.get_nowait()
+                    nxt = self._save_queue.get_nowait()
                 except queue.Empty:
                     break
-                if snapshot is None:
-                    self._save_stop.set()
-                    return
+                if nxt is None:
+                    stop_after_write = True
+                    break
+                snapshot = nxt
             try:
                 self._atomic_write(snapshot)
+                # v2.0 (R-01): refresh the export cache after every
+                # successful disk write. Webhook /export now serves this
+                # cache instead of paying for a fresh snapshot.
+                self._cached_snapshot    = snapshot
+                self._cached_snapshot_at = time.time()
             except Exception as e:
-                logging.warning(f'[envtune] async save failed: {e}')
+                self._record_error('save_worker')
+                log.warning(f'[envtune] async save failed: {e}')
+            if stop_after_write:
+                self._save_stop.set()
+                return
 
     def _atomic_write(self, snapshot):
         """Atomic write with fsync."""
@@ -2379,9 +3876,9 @@ class EnvTune(plugins.Plugin):
                 try:
                     self._save_queue.put_nowait(snapshot)
                 except queue.Full:
-                    logging.debug('[envtune] save queue full — dropping snapshot')
+                    log.debug('[envtune] save queue full — dropping snapshot')
             except Exception as e:
-                logging.warning(f'[envtune] snapshot build failed: {e}')
+                log.warning(f'[envtune] snapshot build failed: {e}')
             self.epochs_since_save = 0
 
     def _sync_save_now(self):
@@ -2390,7 +3887,7 @@ class EnvTune(plugins.Plugin):
             snapshot = self._build_state_snapshot()
             self._atomic_write(snapshot)
         except Exception as e:
-            logging.warning(f'[envtune] sync save failed: {e}')
+            log.warning(f'[envtune] sync save failed: {e}')
 
     def _enqueue_save(self, reason='manual'):
         """Push a snapshot to the async save queue. Drops on full queue
@@ -2399,15 +3896,117 @@ class EnvTune(plugins.Plugin):
             snapshot = self._build_state_snapshot()
             try:
                 self._save_queue.put_nowait(snapshot)
-                logging.debug(f'[envtune] save enqueued ({reason})')
+                log.debug(f'[envtune] save enqueued ({reason})')
             except queue.Full:
-                logging.debug(f'[envtune] save queue full — drop ({reason})')
+                log.debug(f'[envtune] save queue full — drop ({reason})')
         except Exception as e:
-            logging.warning(f'[envtune] enqueue save failed ({reason}): {e}')
+            log.warning(f'[envtune] enqueue save failed ({reason}): {e}')
 
     # ═════════════════════════════════════════════════════════════════════
     # Plugin lifecycle
     # ═════════════════════════════════════════════════════════════════════
+
+    def _validate_cfg(self):
+        """v2.0 (R-05): validate every cfg value against expected type
+        and range, log warnings for out-of-bound values, repair where
+        safe.
+
+        Doesn't crash on bad config — that would prevent the plugin
+        from loading at all. Logs WARNING and falls back to DEFAULTS
+        for any malformed value.
+        """
+        # (key, expected_type, optional_min, optional_max)
+        expected = [
+            ('ema_alpha',                  float, 0.01,  1.0),
+            ('warmup_epochs',               int,   1,    None),
+            ('dense_aps',                   int,   1,    None),
+            ('sparse_aps',                  int,   1,    None),
+            ('ucb_c',                      float, 0.0,   None),
+            ('ucb_c_floor',                float, 0.0,   None),
+            ('ucb_c_anneal_epochs',         int,   1,    None),
+            ('warmstart_prior_reward',     float, 0.0,   1.0),
+            ('stagnation_epochs',           int,   1,    None),
+            ('exploration_boost_epochs',    int,   1,    None),
+            ('forced_explore_every',        int,   0,    None),
+            ('forced_explore_starvation_n', int,   1,    None),
+            ('reward_delay',                int,   1,    None),
+            ('temp_warn',                  float, 0.0,   150.0),
+            ('temp_critical',              float, 0.0,   150.0),
+            ('auto_strategy_block_secs',    int,  60,    None),
+            ('auto_strategy_block_epochs',  int,   0,    None),
+            ('auto_strategy_c',            float, 0.0,   None),
+            ('channel_full_sweep_every',    int,   2,    None),
+            ('chistos_max_channels',        int,  10,    None),
+            ('mood_threshold_epochs',       int,   1,    None),
+            ('client_recency_epochs',       int,   1,    None),
+            ('battery_low_threshold',      float, 0.0,   100.0),
+            ('battery_critical_threshold', float, 0.0,   100.0),
+        ]
+        for key, typ, lo, hi in expected:
+            if key not in self.cfg:
+                continue
+            val = self.cfg[key]
+            try:
+                # int and float are interchangeable for validation
+                # purposes (we accept int values for float configs).
+                if typ is float:
+                    coerced = float(val)
+                else:
+                    coerced = int(val)
+            except (TypeError, ValueError):
+                log.warning(
+                    f'[envtune] cfg.{key}={val!r} not a {typ.__name__} '
+                    f'— falling back to default {self.DEFAULTS[key]!r}')
+                self.cfg[key] = self.DEFAULTS[key]
+                continue
+            if lo is not None and coerced < lo:
+                log.warning(
+                    f'[envtune] cfg.{key}={coerced} below min {lo} '
+                    f'— clamped to {lo}')
+                self.cfg[key] = lo if typ is float else int(lo)
+            elif hi is not None and coerced > hi:
+                log.warning(
+                    f'[envtune] cfg.{key}={coerced} above max {hi} '
+                    f'— clamped to {hi}')
+                self.cfg[key] = hi if typ is float else int(hi)
+        # Strategy enum
+        s = self.cfg.get('channel_strategy')
+        if s not in ('auto', 'adaptive', 'full', 'capped'):
+            log.warning(
+                f'[envtune] cfg.channel_strategy={s!r} unknown — '
+                f'falling back to "auto"')
+            self.cfg['channel_strategy'] = 'auto'
+        # v2.2.0: coerce prefer_stability to bool — common typo: "true"/"yes"
+        ps = self.cfg.get('prefer_stability', True)
+        if isinstance(ps, str):
+            self.cfg['prefer_stability'] = ps.lower() in ('1', 'true', 'yes', 'on')
+        elif not isinstance(ps, bool):
+            self.cfg['prefer_stability'] = bool(ps)
+        # Block-config consistency
+        if (int(self.cfg.get('auto_strategy_block_epochs', 0) or 0) > 0
+                and int(self.cfg.get('auto_strategy_block_secs', 1800)) > 0):
+            log.info(
+                '[envtune] cfg: both auto_strategy_block_epochs and '
+                'auto_strategy_block_secs are set — epochs takes priority '
+                '(legacy v1.9 back-compat)')
+
+    def _check_pwnagotchi_compat(self):
+        """v2.0 (P-10): warn if running on a pwnagotchi version we
+        haven't verified against. Doesn't block load; just informs."""
+        if not self.cfg.get('verify_pwnagotchi_version', True):
+            return
+        try:
+            pwn_ver = getattr(__import__('pwnagotchi'), '__version__', None)
+        except Exception:
+            pwn_ver = None
+        if not pwn_ver:
+            return
+        if not any(pwn_ver.startswith(p)
+                   for p in self.PWNAGOTCHI_VERIFIED_VERSIONS):
+            log.warning(
+                f'[envtune] running on pwnagotchi {pwn_ver} — outside '
+                f'verified range {self.PWNAGOTCHI_VERIFIED_VERSIONS}. '
+                f'Plugin should still work but is not guaranteed.')
 
     def on_loaded(self):
         # Merge user options into config
@@ -2419,20 +4018,34 @@ class EnvTune(plugins.Plugin):
         except Exception:
             pass
 
+        # v2.0 (R-05, P-10): validate config + check pwnagotchi version
+        # BEFORE we initialise anything that depends on cfg.
+        self._validate_cfg()
+        self._check_pwnagotchi_compat()
+
         # Resolve CPU profile
         chosen = self.cfg.get('cpu_profile')
         if not chosen or chosen not in CPU_PROFILES:
             hw = _detect_hardware()
             chosen = HW_DEFAULT_PROFILE.get(hw, 'balanced')
-            logging.info(f'[envtune] auto-selected CPU profile "{chosen}" '
-                         f'for detected hardware: {hw}')
+            log.info(f'[envtune] auto-selected CPU profile "{chosen}" '
+                     f'for detected hardware: {hw}')
         self._profile = dict(CPU_PROFILES[chosen])
         self._profile_name = chosen
 
-        # Set log level
+        # Now that cfg is final, size the decision buffer so it can hold
+        # `reward_delay` + a generous margin for adaptive sparse delay.
+        # Adaptive delay = base + 1 in sparse environments; floor 8 so
+        # operators aren't surprised if they tune reward_delay = 5.
+        decision_max = max(8, int(self.cfg.get('reward_delay', 3)) + 4)
+        self._decision_buffer = deque(maxlen=decision_max)
+
+        # Set log level on the NAMED 'envtune' logger only. v1.5 mutated
+        # the ROOT logger which leaked envtune's verbosity into every
+        # other Pwnagotchi component (bettercap-bridge, mesh, plugins).
         try:
             level = self.cfg.get('log_level', 'INFO').upper()
-            logging.getLogger().setLevel(getattr(logging, level, logging.INFO))
+            log.setLevel(getattr(logging, level, logging.INFO))
         except Exception:
             pass
 
@@ -2445,20 +4058,44 @@ class EnvTune(plugins.Plugin):
         # Apply time-of-day priors (only fills n=0 entries)
         self._apply_tod_prior()
 
+        # v1.7: merge community priors if any exports are present in
+        # COMMUNITY_PRIORS_DIR. Runs after _load_state and TOD priors
+        # so local data (real samples) and TOD priors (synthetic
+        # cold-start) take precedence in the deque.
+        try:
+            files_n, samples_n, errs = self._merge_community_priors()
+            if files_n:
+                log.info(
+                    f'[envtune] community priors: merged '
+                    f'{samples_n} samples from {files_n} file(s)'
+                    + (f' ({errs} errors)' if errs else ''))
+        except Exception as e:
+            log.debug(f'[envtune] community priors merge failed: {e}')
+
         # Merge state-restored BSSIDs with current handshake-dir scan.
         # State has the authoritative lifetime count; disk has authoritative
         # presence — neither alone is reliable across pcap-deletes / wipes.
         self._captured_bssids |= self._scan_handshake_dir()
 
-        # Scan wpa-sec potfile for cracked networks
-        self._cracked_bssids = self._scan_cracked_potfile()
+        # Scan wpa-sec potfile for cracked networks. v1.8.1: MERGE with
+        # the state-restored set instead of REPLACING it. Real-world
+        # cases where state has cracked BSSIDs the live potfile doesn't:
+        #   - User used wpa-sec briefly, then disabled it.
+        #   - Potfile got rotated/truncated between runs.
+        #   - User runs envtune on a Pi without wpa-sec at all (this set
+        #     stays empty from the potfile, but state may have entries
+        #     from a prior wpa-sec-equipped install or from a crack
+        #     cracked elsewhere and noted manually).
+        # The comment in _load_state explicitly said "safety net rather
+        # than the source of truth" — but the code was overwriting.
+        self._cracked_bssids |= self._scan_cracked_potfile()
 
         # First-run init: if no persisted lifetime_new_count yet, seed it
         # from the existing handshake count. Otherwise we'd treat every
         # already-captured AP as "lifetime new" the next time we see it.
         if self._lifetime_new_count == 0 and len(self._captured_bssids) > 0:
             self._lifetime_new_count = len(self._captured_bssids)
-            logging.info(
+            log.info(
                 f'[envtune] First run with existing handshakes — '
                 f'seeding lifetime_new_count from disk '
                 f'({self._lifetime_new_count} unique BSSIDs)')
@@ -2475,32 +4112,172 @@ class EnvTune(plugins.Plugin):
         # bcap_skip_captured / bcap_skip_cracked config flags. The
         # initial push happens in on_ready once the agent is wired up.
 
+        # Seed total-samples counter from the loaded + primed UCB table.
+        # From here on, _ucb_update keeps it incrementally up-to-date.
+        self._recompute_total_real_samples()
+
         # Start async save thread
         self._save_thread = threading.Thread(
             target=self._save_worker, name='envtune-save', daemon=True)
         self._save_thread.start()
 
-        logging.info(
+        log.info(
             f'[envtune] v{self.__version__} loaded | profile={chosen} | '
             f'ucb_window={self._profile["ucb_window"]} | '
+            f'samples={self._total_real_samples} | '
             f'lifetime_hs={self.lifetime_handshakes} | '
             f'lifetime_unique={self._lifetime_new_count} | '
             f'pre_captured={len(self._captured_bssids)} | '
             f'cracked={len(self._cracked_bssids)} | '
+            f'hpm_hist={len(self._recent_hpm)} | '
             f'best_reward={self.best_reward}')
 
     def on_ready(self, agent):
         self._agent = agent
+
+        # v2.1.0 CRITICAL FIX: resolve the real handshake dir from
+        # bettercap config. v2.0 hardcoded /root/handshakes — but the
+        # noai default is /etc/pwnagotchi/handshakes. Without this fix
+        # the lifetime-new-handshake tracking finds NO captured BSSIDs
+        # at startup → every old AP looks "new" → bandit gets credited
+        # for things it didn't do.
+        try:
+            bcap_cfg = agent._config.get('bettercap', {}) or {}
+            hs_path = bcap_cfg.get('handshakes')
+            if hs_path:
+                self._hs_dir = str(hs_path)
+                # wpa-sec potfile lives next to handshakes by convention
+                self._wpasec_pot = os.path.join(
+                    self._hs_dir, 'wpa-sec.cracked.potfile')
+            log.info(f'[envtune] handshake dir resolved: {self._hs_dir}')
+        except Exception as e:
+            log.warning(
+                f'[envtune] could not resolve handshake dir from cfg: {e} '
+                f'— falling back to {self._hs_dir}')
+
+        # v2.1.0: detect bettercap event-silence list. By default, noai
+        # silences `wifi.ap.new`, `wifi.ap.lost`, `wifi.client.new`,
+        # `wifi.client.lost`. Our `on_bcap_*` handlers are dead code if
+        # those tags are silenced — we warn so operators understand
+        # opportunistic-channel-override and free-channel detection
+        # require un-silencing.
+        try:
+            silence = (agent._config.get('bettercap', {}) or {}).get(
+                'silence', []) or []
+            self._bcap_silenced_events = set(silence)
+            critical = {
+                'wifi.ap.new', 'wifi.ap.lost',
+                'wifi.client.new', 'wifi.client.lost',
+            }
+            silenced_critical = critical & self._bcap_silenced_events
+            if silenced_critical:
+                log.warning(
+                    f'[envtune] bettercap silence list includes '
+                    f'{sorted(silenced_critical)} — opportunistic-channel '
+                    f'override and live AP/client tracking are limited. '
+                    f'To enable, remove these from bettercap.silence in '
+                    f'config.toml.')
+        except Exception as e:
+            log.debug(f'[envtune] silence-list inspect: {e}')
+
+        # v2.1.0: re-merge BSSIDs from the now-correct handshake dir
+        # (on_loaded scanned the wrong dir before agent was ready).
+        new_from_disk = self._scan_handshake_dir()
+        with self._state_lock:
+            before = len(self._captured_bssids)
+            self._captured_bssids |= new_from_disk
+            added = len(self._captured_bssids) - before
+        if added:
+            self._lifetime_new_count = max(
+                self._lifetime_new_count, len(self._captured_bssids))
+            log.info(
+                f'[envtune] +{added} BSSIDs adopted from real handshake dir '
+                f'(total captured = {len(self._captured_bssids)}, '
+                f'lifetime_new = {self._lifetime_new_count})')
+            # Reset the prev counter so we don't credit this on_epoch.
+            self._lifetime_new_count_prev = self._lifetime_new_count
+
+        # v2.1.0: cross-check our scan against pwnagotchi's helper. The
+        # helper just counts *.pcap files (counts each as unique). If our
+        # BSSID-extracted count is significantly LOWER than the file count,
+        # something is off (e.g. unexpected filename format on this fork).
+        try:
+            pwn_count = pwnagotchi.utils.total_unique_handshakes(self._hs_dir)
+            our_count = len(self._captured_bssids)
+            if pwn_count and our_count < pwn_count * 0.5:
+                log.warning(
+                    f'[envtune] handshake count sanity-check: pwnagotchi '
+                    f'sees {pwn_count} pcap files but we extracted only '
+                    f'{our_count} BSSIDs — filename format on this fork '
+                    f'may be unexpected. Check /etc/pwnagotchi/handshakes/ '
+                    f'manually if lifetime_new tracking looks off.')
+        except Exception as e:
+            log.debug(f'[envtune] HS count sanity-check failed: {e}')
+
+        # Same for the wpa-sec potfile (now at the correct path).
+        new_cracked = self._scan_cracked_potfile()
+        if new_cracked:
+            with self._state_lock:
+                added = len(new_cracked - self._cracked_bssids)
+                self._cracked_bssids |= new_cracked
+            if added:
+                log.info(f'[envtune] +{added} cracked BSSIDs adopted from '
+                         f'real wpa-sec potfile')
+
         self._detect_supported_params(agent)
         self._load_whitelist(agent)
+
+        # v1.7.1: capture user's original channel universe BEFORE we
+        # ever touch personality.channels. Empty list (pwnagotchi
+        # semantics for "no restriction") expands to the iface's full
+        # supported list. Stored as a sorted list for deterministic
+        # ordering in logs/UI.
+        try:
+            orig = list(agent._config.get('personality', {}).get(
+                'channels') or [])
+            if orig:
+                self._user_channels_orig = sorted(set(int(c) for c in orig))
+                log.info(f'[envtune] user channel universe (explicit): '
+                         f'{len(self._user_channels_orig)} channels '
+                         f'{self._user_channels_orig}')
+            else:
+                # Empty list = "scan all" in pwnagotchi semantics.
+                # Resolve via iface_channels (the hardware-supported
+                # set). Falls back to 2.4 GHz 1-11 if that fails.
+                try:
+                    iface = agent._config['main']['iface']
+                    full = list(pwnagotchi.utils.iface_channels(iface))
+                except Exception:
+                    full = list(range(1, 12))
+                if hasattr(agent, '_supported_channels') and agent._supported_channels:
+                    full = list(set(full) | set(agent._supported_channels))
+                self._user_channels_orig = sorted(set(int(c) for c in full))
+                log.info(f'[envtune] user channel universe (unrestricted '
+                         f'→ all iface-supported): '
+                         f'{len(self._user_channels_orig)} channels')
+        except Exception as e:
+            log.debug(f'[envtune] capture user channels: {e}')
+            self._user_channels_orig = list(range(1, 12))
+        # Warm-start the UCB tables from whatever personality values
+        # the user / previous tuner has set in config.toml. Without
+        # this, the bandit treats every arm equally and burns the
+        # first ~50 epochs re-discovering settings the user already
+        # had right.
+        try:
+            self._apply_personality_warmstart(agent)
+            # Warm-start may have added synthetic n=1 samples — refresh
+            # the counter so shrinkage k anneals correctly.
+            self._recompute_total_real_samples()
+        except Exception as e:
+            log.debug(f'[envtune] warm-start failed: {e}')
 
         # Detect GPS source
         self._gps_source = self._detect_gps_source(agent)
         if self._gps_source:
             self._gps_available = True
-            logging.info(f'[envtune] GPS active via {self._gps_source}')
+            log.info(f'[envtune] GPS active via {self._gps_source}')
         else:
-            logging.info('[envtune] GPS not detected — '
+            log.info('[envtune] GPS not detected — '
                          'plugin runs without zone awareness')
 
         # Initial bettercap sync — push current personality values to bettercap
@@ -2510,13 +4287,16 @@ class EnvTune(plugins.Plugin):
                 if param in p:
                     self._bettercap_sync(agent, {param: p[param]})
         except Exception as e:
-            logging.debug(f'[envtune] initial bettercap sync: {e}')
+            log.debug(f'[envtune] initial bettercap sync: {e}')
 
         # Push initial captured-BSSID skip list so bettercap deprioritises
         # duplicates from the very first attack cycle of this session.
         self._push_bcap_skip_list(agent, force=True)
 
-        if self.cfg.get('reset_history', True):
+        # reset_history default MUST match DEFAULTS (False). Old code
+        # had `True` as the .get() fallback — destructive if the key
+        # ever went missing from cfg (e.g. partial state migration).
+        if self.cfg.get('reset_history', False):
             try:
                 agent._history = {}
                 agent.run('wifi.recon clear')
@@ -2524,14 +4304,24 @@ class EnvTune(plugins.Plugin):
                 chs = agent._config['personality'].get('channels') or [1, 6, 11]
                 agent.run('wifi.recon.channel %s' % ','.join(map(str, chs)))
             except Exception as e:
-                logging.warning(f'[envtune] history reset: {e}')
+                log.warning(f'[envtune] history reset: {e}')
 
         if agent._config.get('ai', {}).get('enabled', False):
-            logging.info('[envtune] pwnagotchi AI mode is active — '
+            log.info('[envtune] pwnagotchi AI mode is active — '
                          'envtune will be a passive observer')
         else:
-            logging.info(f'[envtune] active and learning '
-                         f'(tuning {len(self._active_params)} params)')
+            stability = bool(self.cfg.get('prefer_stability', True))
+            mode_msg = ('STABILITY mode (noai-aligned: no proactive attacks, '
+                        'no opportunistic channel overrides, full strategy '
+                        'banned while moving) — set prefer_stability=false '
+                        'in config.toml for max-yield mode'
+                        if stability else
+                        'AGGRESSIVE mode (proactive attacks + opportunistic '
+                        'channel overrides enabled) — slightly higher capture '
+                        'rate at the cost of more radio activity. Set '
+                        'prefer_stability=true to align with noai philosophy')
+            log.info(f'[envtune] active and learning '
+                     f'(tuning {len(self._active_params)} params, {mode_msg})')
 
     def on_unload(self, ui):
         self._sync_save_now()
@@ -2542,7 +4332,7 @@ class EnvTune(plugins.Plugin):
             pass
         if self._save_thread and self._save_thread.is_alive():
             self._save_thread.join(timeout=2.0)
-        logging.info('[envtune] unloaded — final state saved')
+        log.info('[envtune] unloaded — final state saved')
 
     def on_ui_setup(self, ui):
         self._ui = ui
@@ -2626,6 +4416,12 @@ class EnvTune(plugins.Plugin):
             num_hops     = _si(epoch_data.get('num_hops',             0))
             temperature  = _sf(epoch_data.get('temperature',          40.0))
             cpu_load     = _sf(epoch_data.get('cpu_load',             0.0))
+            # v2.1.0 — verified noai _epoch_data fields
+            num_peers    = _si(epoch_data.get('num_peers',            0))
+            mem_usage    = _sf(epoch_data.get('mem_usage',            0.0))
+            slept_secs   = _sf(epoch_data.get('slept_for_secs',       0.0))
+            # native 'reward' field absent in noai (AI removed); pwnagotchi
+            # noai never writes this key. We just store 0.0 for back-compat.
             native_rwd   = _sf(epoch_data.get('reward', 0.0))
             ep_total     = max(1, _si(epoch_data.get('epoch', epoch)) or epoch or 1)
             # Mood counters from pwnagotchi's own epoch tracker. Original AI
@@ -2657,6 +4453,12 @@ class EnvTune(plugins.Plugin):
             lifetime_new_this_epoch = max(0, lifetime_new_this_epoch)
             self._lifetime_new_count_prev = self._lifetime_new_count
 
+            # v1.9.0: advance the auto-strategy block-bandit. Uses the
+            # just-updated lifetime_new_count to score the current block
+            # if it just expired, then picks the next block's strategy
+            # via UCB1. No-op when channel_strategy != 'auto'.
+            self._maybe_advance_strategy_block()
+
             # New APs discovered this epoch (not necessarily captured —
             # exploration value, even when no handshake yet)
             current_ap_count = len(self._known_aps)
@@ -2670,18 +4472,6 @@ class EnvTune(plugins.Plugin):
             with self._state_lock:
                 aps_items_snap  = list(self._known_aps.items())
                 aps_values_snap = [v for _, v in aps_items_snap]
-
-            # "Underlying work" proxy — did we DO things this epoch even
-            # if no handshake came out? Assoc/deauth attempts on uncaptured
-            # APs (vs wasted on already-captured) count as productive work.
-            # Avoids the trap where 0-handshake epochs all look identical.
-            uncaptured_attacks = sum(
-                ap.get('AT_attacks', 0) for ap in aps_values_snap
-                if not ap.get('AT_already_captured', False)
-            )
-            attack_efficiency_proxy = (
-                min(1.0, interactions / 10.0) if uncaptured_attacks > 0 else 0.0
-            )
 
             # ── 2. Save pre-update aps_ema for nexmon crash check ─────────
             self._prev_aps_ema = self.ema.get('aps')
@@ -2705,6 +4495,10 @@ class EnvTune(plugins.Plugin):
             _        = self._ema('hops_per_epoch', num_hops)
             t_ema    = self._ema('temperature',    temperature)
             _        = self._ema('cpu_load',       cpu_load)
+            # v2.1.0 — verified noai _epoch_data fields
+            _        = self._ema('num_peers',      num_peers)
+            _        = self._ema('mem_usage',      mem_usage)
+            _        = self._ema('slept_for_secs', slept_secs)
             if self._gps_last_fix is not None:
                 _ = self._ema('speed', self._gps_last_fix.get('speed', 0))
 
@@ -2714,18 +4508,20 @@ class EnvTune(plugins.Plugin):
 
             # ── 5. Compute custom reward ──────────────────────────────────
             blind_ratio = blind_for / ep_total
-            bored_ratio = (bored_for / ep_total) if bored_for >= 5 else 0.0
-            sad_ratio   = (sad_for   / ep_total) if sad_for   >= 5 else 0.0
+            # v2.0 (F-10): mood_threshold_epochs from DEFAULTS, was hardcoded 5
+            mood_thresh = int(self.cfg.get('mood_threshold_epochs', 5))
+            bored_ratio = (bored_for / ep_total) if bored_for >= mood_thresh else 0.0
+            sad_ratio   = (sad_for   / ep_total) if sad_for   >= mood_thresh else 0.0
             custom_rwd = self._custom_reward(
                 handshakes, hs_rate, missed_rate, native_rwd, dur_secs,
                 lifetime_new_this_epoch, active_ratio, inactive_ratio, hops_ratio,
-                new_aps_seen, attack_efficiency_proxy, interactions,
+                new_aps_seen, interactions,
                 blind_ratio=blind_ratio, bored_ratio=bored_ratio,
                 sad_ratio=sad_ratio)
 
             # ── 6. Nexmon crash detection ─────────────────────────────────
             if self._check_nexmon_crash(aps, interactions):
-                logging.warning('[envtune] nexmon crash suspected — '
+                log.warning('[envtune] nexmon crash suspected — '
                                 'aggressive throttle')
                 p = agent._config['personality']
                 if 'throttle_d' in self._active_params:
@@ -2750,22 +4546,25 @@ class EnvTune(plugins.Plugin):
                 self._dead_session.clear()
                 self._free_channels.clear()
                 self._ucb_cache.clear()
-                # FIX: stale decisions in the buffer were taken in the
-                # previous environment — attributing rewards from the new
-                # environment to them corrupts UCB stats. But discarding
-                # them entirely means UCB never learns *anything* from arms
-                # explored just before a move, which under-tests them. Give
-                # each pending decision a neutral 0.5 credit so the visit
-                # count grows but the mean is centred — UCB will still
-                # explore them again, just not pessimistically.
-                neutral = 0.5
-                for _ep, old_state, old_params in list(self._decision_buffer):
-                    for param, val in old_params.items():
-                        self._ucb_update(param, old_state, val, neutral)
+                # v1.7: drop buffered decisions outright. v1.5 credited
+                # them with neutral 0.5 so visit counts kept growing,
+                # but real community telemetry showed the resulting
+                # `n=1, mean=0.5` entries pile up across roving sessions
+                # and drift cell means toward 0.5, masking both
+                # genuinely-bad arms (mean<0.3) and genuinely-good ones
+                # (mean>0.7). The exploration_boost above already widens
+                # UCB's bound for the new environment, which is the
+                # correct way to handle "we just teleported."
+                dropped = len(self._decision_buffer)
                 self._reset_decision_buffer()
-                logging.info(f'[envtune] location change → '
-                             f'{boost}-ep exploration boost '
-                             f'(neutral-credited buffered decisions)')
+                # v2.0 (F-06): also abort the strategy bandit's in-progress
+                # block. The block ran in a now-stale environment;
+                # scoring it would credit the wrong context. Next epoch
+                # starts a clean block under the new mobility's bandit.
+                self._abort_strategy_block(reason='location change')
+                log.info(f'[envtune] location change → '
+                         f'{boost}-ep exploration boost '
+                         f'(dropped {dropped} buffered decisions)')
 
             # ── 9. Attribute delayed reward to earlier decision ───────────
             # Adaptive reward_delay: in dense AP environments, parameter
@@ -2807,7 +4606,7 @@ class EnvTune(plugins.Plugin):
                 if self._exploration_boost <= 0:
                     self._exploration_boost = int(
                         self.cfg['exploration_boost_epochs'])
-                    logging.info(
+                    log.info(
                         f'[envtune] saturation '
                         f'({cap_in_view}/{visible} captured nearby) → '
                         f'{self._exploration_boost}-ep exploration boost')
@@ -2824,7 +4623,7 @@ class EnvTune(plugins.Plugin):
                 if self._blind_recovery == 0:
                     self._blind_saved_params = {
                         k: p.get(k) for k in self._active_params}
-                    logging.warning(f'[envtune] BLIND PANIC '
+                    log.warning(f'[envtune] BLIND PANIC '
                                     f'(blind_for={blind_for})')
                 p['min_rssi']         = self.BOUNDS['min_rssi'][0]
                 p['recon_time']       = self.BOUNDS['recon_time'][1]
@@ -2953,9 +4752,10 @@ class EnvTune(plugins.Plugin):
                     if (age >= 200
                             and has_fresh
                             and _sf(ap.get('rssi', -85)) > -65):
-                        ap['AT_pmf_detected'] = False
-                        ap['AT_attacks']      = 0
-                        ap['AT_missed']       = 0
+                        ap['AT_pmf_detected']    = False
+                        ap['AT_pmf_detected_ep'] = 0   # v1.6 fix: was leaking
+                        ap['AT_attacks']         = 0
+                        ap['AT_missed']          = 0
 
             # ── 19. Sanity check parameter coupling ───────────────────────
             chosen = self._sanity_check(chosen)
@@ -3021,7 +4821,14 @@ class EnvTune(plugins.Plugin):
             self._push_bcap_skip_list(agent)
 
             # ── 24. Proactive attacks for high-value targets (opt-in) ─────
-            if (self._profile['enable_proactive']
+            # v2.2.0: gate behind prefer_stability — when True (default),
+            # NEVER fire extra wifi.assoc frames beyond pwnagotchi's
+            # natural loop. The noai branch was created precisely to
+            # stop the AI's extra radio TX from destabilising firmware;
+            # this plugin honours that.
+            stability = bool(self.cfg.get('prefer_stability', True))
+            if (not stability
+                    and self._profile['enable_proactive']
                     and self.cfg.get('opportunistic_overrides', True)
                     and self.epochs_seen - self._last_proactive_ep
                         >= int(self.cfg['proactive_gap_epochs'])
@@ -3038,7 +4845,7 @@ class EnvTune(plugins.Plugin):
                             key=lambda x: -x[1]['hs'])[:3]
             top_s  = ','.join(f'{c}:{d["hs"]}' for c, d in top_ch) or 'none'
             zone_s = self._current_zone or '-'
-            logging.info(
+            log.info(
                 f'[envtune] ep={epoch} st={state} mood={self._mood} '
                 f'aps={aps_ema:.0f} hs_rt={hs_ema:.2f} '
                 f'hpm={self.ema["hs_per_min"]:.2f} miss={mi_ema:.2f} '
@@ -3048,7 +4855,7 @@ class EnvTune(plugins.Plugin):
                 f'top={top_s} zone={zone_s} mob={self._current_mobility}')
 
             # ── 27. Verbose DEBUG dump ────────────────────────────────────
-            logging.debug(f'[envtune] params={chosen} expl={self._exploration_boost} '
+            log.debug(f'[envtune] params={chosen} expl={self._exploration_boost} '
                           f'fresh_clients={total_fresh_clients}')
             if self._last_reward_breakdown:
                 # Compact one-line component log so operators can see WHY
@@ -3058,7 +4865,7 @@ class EnvTune(plugins.Plugin):
                     self._last_reward_breakdown.items(),
                     key=lambda kv: -abs(kv[1]))
                 comps = ' '.join(f'{k}={v:+.3f}' for k, v in items)
-                logging.debug(f'[envtune] reward_components: {comps}')
+                log.debug(f'[envtune] reward_components: {comps}')
 
             # ── 28. Periodic wpa-sec potfile rescan ───────────────────────
             # External tool (cron / wpa-sec.py) appends to the potfile
@@ -3073,17 +4880,19 @@ class EnvTune(plugins.Plugin):
                     if cracked:
                         with self._state_lock:
                             added = len(cracked - self._cracked_bssids)
-                            self._cracked_bssids = cracked
+                            # v1.8.1: MERGE not REPLACE — see notes in
+                            # on_loaded and the rescan-potfile webhook.
+                            self._cracked_bssids |= cracked
                             if added:
                                 for ap in self._known_aps.values():
-                                    if self._mac_norm(ap.get('mac', '')) in cracked:
+                                    if self._mac_norm(ap.get('mac', '')) in self._cracked_bssids:
                                         ap['AT_cracked'] = True
                         if added:
-                            logging.info(f'[envtune] potfile rescan: '
-                                         f'+{added} cracked BSSIDs '
-                                         f'({len(cracked)} total)')
+                            log.info(f'[envtune] potfile rescan: '
+                                     f'+{added} cracked BSSIDs '
+                                     f'({len(self._cracked_bssids)} total)')
                 except Exception as e:
-                    logging.debug(f'[envtune] potfile rescan: {e}')
+                    log.debug(f'[envtune] potfile rescan: {e}')
 
             # ── 29. Handshake-dir rescan watchdog ─────────────────────────
             # If something external (wpa-sec sync, manual copy, another
@@ -3104,7 +4913,7 @@ class EnvTune(plugins.Plugin):
                                 self._lifetime_new_count,
                                 len(self._captured_bssids))
                     if new_macs:
-                        logging.info(
+                        log.info(
                             f'[envtune] handshake-dir watchdog: '
                             f'+{len(new_macs)} BSSIDs adopted from disk')
                         # _push_bcap_skip_list rebuilds from the
@@ -3115,12 +4924,13 @@ class EnvTune(plugins.Plugin):
                         except Exception:
                             pass
                 except Exception as e:
-                    logging.debug(f'[envtune] handshake-dir watchdog: {e}')
+                    log.debug(f'[envtune] handshake-dir watchdog: {e}')
 
             self._maybe_save()
 
         except Exception as e:
-            logging.exception(f'[envtune] on_epoch: {e}')
+            self._record_error('on_epoch')
+            log.exception(f'[envtune] on_epoch: {e}')
 
     def _reset_decision_buffer(self):
         """Clear delayed-reward queue when we skip the UCB select path."""
@@ -3176,6 +4986,14 @@ class EnvTune(plugins.Plugin):
                         continue
                 if rssi < self.cfg['proactive_min_rssi']:
                     continue
+                # v2.2: require minimum client count (was declared in
+                # DEFAULTS since v1.x but never actually enforced).
+                # Hidden APs already get a stricter clients>=1 gate
+                # above; this applies the user-configurable floor to
+                # all proactive candidates.
+                min_clients = int(self.cfg.get('proactive_min_clients', 1))
+                if clients < min_clients:
+                    continue
                 # FIX: validate MAC syntactically before sending to bcap —
                 # malformed entries would cause the agent.run command to
                 # silently fail or, worse, parse wrong.
@@ -3201,9 +5019,9 @@ class EnvTune(plugins.Plugin):
             with self._state_lock:
                 if best_ap is self._known_aps.get(self._ap_id(best_ap)):
                     best_ap['AT_lastattack_ep'] = self.epochs_seen
-            logging.debug(f'[envtune] proactive assoc → {mac}')
+            log.debug(f'[envtune] proactive assoc → {mac}')
         except Exception as e:
-            logging.debug(f'[envtune] proactive: {e}')
+            log.debug(f'[envtune] proactive: {e}')
 
     # ═════════════════════════════════════════════════════════════════════
     # Event callbacks
@@ -3268,6 +5086,10 @@ class EnvTune(plugins.Plugin):
                     if ch:
                         self._gps_zones[self._current_zone]['channels'][ch] += 1
 
+            # Invalidate per-epoch ch_score cache — capturing this AP
+            # changes its channel's score (one fewer uncaptured target).
+            self._ch_score_cache.clear()
+
             self.last_shake = {
                 'time': time.time(),
                 'ap':   access_point,
@@ -3281,7 +5103,7 @@ class EnvTune(plugins.Plugin):
             else:
                 tags.append('dup')
             tags.append('PASSIVE' if passive else 'ACTIVE')
-            logging.info(f'[envtune] handshake [{" ".join(tags)}] ch={ch} '
+            log.info(f'[envtune] handshake [{" ".join(tags)}] ch={ch} '
                          f'lifetime={self.lifetime_handshakes} '
                          f'unique_lifetime={self._lifetime_new_count}')
 
@@ -3296,9 +5118,10 @@ class EnvTune(plugins.Plugin):
                 try:
                     self._push_bcap_skip_list(agent)
                 except Exception as e:
-                    logging.debug(f'[envtune] immediate skip push: {e}')
+                    log.debug(f'[envtune] immediate skip push: {e}')
         except Exception as e:
-            logging.debug(f'[envtune] on_handshake: {e}')
+            self._record_error('on_handshake')
+            log.debug(f'[envtune] on_handshake: {e}')
 
     def on_association(self, agent, access_point):
         try:
@@ -3313,7 +5136,7 @@ class EnvTune(plugins.Plugin):
                     ap['AT_attacks'] = ap.get('AT_attacks', 0) + 1
                     ap['AT_lastattack_ep'] = self.epochs_seen
         except Exception as e:
-            logging.debug(f'[envtune] on_association: {e}')
+            log.debug(f'[envtune] on_association: {e}')
 
     def on_deauthentication(self, agent, access_point, client_station):
         try:
@@ -3328,7 +5151,7 @@ class EnvTune(plugins.Plugin):
                     ap['AT_attacks'] = ap.get('AT_attacks', 0) + 1
                     ap['AT_lastattack_ep'] = self.epochs_seen
         except Exception as e:
-            logging.debug(f'[envtune] on_deauthentication: {e}')
+            log.debug(f'[envtune] on_deauthentication: {e}')
 
     def on_wifi_update(self, agent, access_points):
         try:
@@ -3376,7 +5199,8 @@ class EnvTune(plugins.Plugin):
 
                 self._active_channels = active
         except Exception as e:
-            logging.exception(f'[envtune] on_wifi_update: {e}')
+            self._record_error('on_wifi_update')
+            log.exception(f'[envtune] on_wifi_update: {e}')
 
     def on_bcap_wifi_ap_new(self, agent, event):
         try:
@@ -3412,8 +5236,20 @@ class EnvTune(plugins.Plugin):
                     self._known_aps[apID]['AT_clients'] = (
                         self._known_aps[apID].get('AT_clients', 0) + 1)
                     self._known_aps[apID]['AT_client_epoch'] = self.epochs_seen
-            # Opportunistic channel override
-            if (self.cfg.get('opportunistic_overrides', True)
+            # Opportunistic channel override.
+            # v1.7.1: ch must be inside the user's channel universe.
+            # Users who restricted their config to e.g. [1,6,11] should
+            # never see envtune push channel 4 onto bettercap because
+            # a client showed up there.
+            # v2.2.0: ALSO gated by prefer_stability — the runtime
+            # wifi.recon.channel poke is one of the few places we add
+            # radio reconfiguration beyond the natural recon loop.
+            in_universe = (self._user_channels_orig is None
+                           or ch in self._user_channels_orig)
+            stability = bool(self.cfg.get('prefer_stability', True))
+            if (not stability
+                    and in_universe
+                    and self.cfg.get('opportunistic_overrides', True)
                     and ch not in self._active_channels
                     and self.epochs_seen - self._last_override_ep
                         >= int(self.cfg['opportunistic_min_gap'])):
@@ -3425,11 +5261,11 @@ class EnvTune(plugins.Plugin):
                     agent.run('wifi.recon.channel %s' %
                               ','.join(map(str, current)))
                     self._last_override_ep = self.epochs_seen
-                    logging.debug(f'[envtune] opportunistic override → ch {ch}')
+                    log.debug(f'[envtune] opportunistic override → ch {ch}')
                 except Exception:
                     pass
         except Exception as e:
-            logging.debug(f'[envtune] on_bcap_wifi_client_new: {e}')
+            log.debug(f'[envtune] on_bcap_wifi_client_new: {e}')
 
     def on_bcap_wifi_client_lost(self, agent, event):
         try:
@@ -3443,12 +5279,16 @@ class EnvTune(plugins.Plugin):
         except Exception:
             pass
 
-    # Track missed interactions per AP for early cooldown signal
     def on_bcap_wifi_assoc(self, agent, event):
-        # bettercap fires this on EACH association attempt; count missed ones
-        # by comparing with our own attack counter delta later. For now,
-        # increment attempts; missed is counted via epoch_data.missed_interactions
-        pass
+        # INTENTIONALLY EMPTY. The bettercap-side `wifi.assoc` event fires
+        # on the same attack our `on_association` callback already handles
+        # via pwnagotchi's own pipeline. Counting it here would
+        # double-increment AT_attacks and `_ch_lt[ch]['assocs']`. Missed
+        # interactions are accounted from `epoch_data['missed_interactions']`
+        # in `on_epoch`, not here. Keep this stub so plugins.on() doesn't
+        # log a "no handler" warning if your bettercap build emits the
+        # event under this name.
+        return
 
     # ═════════════════════════════════════════════════════════════════════
     # Web UI (/plugins/envtune/)
@@ -3554,6 +5394,7 @@ class EnvTune(plugins.Plugin):
                 '<p class="subtitle">',
                 f'profile=<b>{profile}</b> | gps=<b>{gps_src}</b> | ',
                 f'mood=<b>{mood}</b> | mobility=<b>{mobility}</b> | ',
+                self._ui_channel_strategy_inline(),
                 f'<a href="{base}?norefresh=1" class="muted">'
                 f'{"⏸ pause refresh" if refresh_secs > 0 else "▶ resume refresh"}</a>',
                 '</p>',
@@ -3564,6 +5405,7 @@ class EnvTune(plugins.Plugin):
                 '</div>',
                 self._ui_summary_cards(current_zone_alias=cur_zone_alias),
                 self._ui_actions(),
+                self._ui_strategy_bandit(),    # v1.9.0 — auto-strategy panel
                 self._ui_reward_breakdown(),
                 self._ui_status(current_zone_alias=cur_zone_alias),
                 self._ui_current_params(),
@@ -3577,7 +5419,8 @@ class EnvTune(plugins.Plugin):
             parts.append('</body></html>')
             return self._html_response(''.join(parts))
         except Exception as e:
-            logging.exception(f'[envtune] webhook: {e}')
+            self._record_error('webhook')
+            log.exception(f'[envtune] webhook: {e}')
             body = ('<!DOCTYPE html><html><body><h1>Error</h1>'
                     f'<pre>{html.escape(repr(e))}</pre></body></html>')
             return self._html_response(body, status=500)
@@ -3711,6 +5554,139 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
             return format(float(v), spec)
         except (ValueError, TypeError):
             return html.escape(str(v))
+
+    def _ui_channel_strategy_inline(self):
+        """Compact strategy indicator for the subtitle line."""
+        try:
+            cfg_mode = self.cfg.get('channel_strategy', 'auto')
+            active = self._resolve_channel_strategy()
+            n_universe = len(self._user_channels_orig or [])
+            sweep_every = max(2, int(self.cfg.get(
+                'channel_full_sweep_every', 15)))
+
+            if cfg_mode == 'auto':
+                block_size = max(5, int(self.cfg.get(
+                    'auto_strategy_block_epochs', 30)))
+                eib = max(0, self.epochs_seen - self._strategy_block_start_ep)
+                left = max(0, block_size - eib)
+                tip = (f'auto: meta-bandit cycles through adaptive/full/capped '
+                       f'in {block_size}-epoch blocks, picks the strategy that '
+                       f'captures the most unique HS in YOUR environment')
+                return (f'<span title="{html.escape(tip)}">'
+                        f'channels=<b>auto→{html.escape(active)}</b> '
+                        f'<small>(block {eib}/{block_size})</small></span> | ')
+            if active == 'adaptive':
+                next_sweep = max(0, sweep_every -
+                                 (self.epochs_seen - self._last_full_sweep_ep))
+                tip = (f'adaptive: top-K most epochs, full {n_universe}-channel '
+                       f'sweep every {sweep_every} epochs')
+                return (f'<span title="{html.escape(tip)}">'
+                        f'channels=<b>adaptive</b> '
+                        f'<small>({n_universe}ch, sweep in {next_sweep})</small>'
+                        f'</span> | ')
+            if active == 'full':
+                tip = f'full sweep every epoch — {n_universe} channels'
+                return (f'<span title="{html.escape(tip)}">'
+                        f'channels=<b>full</b> '
+                        f'<small>({n_universe}ch)</small></span> | ')
+            tip = f'capped — top scored channels only, no full sweeps'
+            return (f'<span title="{html.escape(tip)}">'
+                    f'channels=<b>capped</b> '
+                    f'<small>({n_universe}ch universe)</small></span> | ')
+        except Exception:
+            return ''
+
+    def _ui_strategy_bandit(self):
+        """Full panel showing the strategy meta-bandit's stats — only
+        rendered when channel_strategy='auto'.
+
+        v2.0: shows BOTH mobility bandits (stationary + moving), so
+        operators see how strategy preference differs across mobility.
+        """
+        try:
+            if self.cfg.get('channel_strategy') != 'auto':
+                return ''
+            # Block-duration display uses whichever mode is active
+            epochs_legacy = int(self.cfg.get('auto_strategy_block_epochs', 0) or 0)
+            if epochs_legacy > 0:
+                block_unit = f'{epochs_legacy}ep'
+            else:
+                secs = int(self.cfg.get('auto_strategy_block_secs', 1800))
+                block_unit = f'{secs}s'
+            with self._state_lock:
+                snap = {
+                    mob: {
+                        s: {'n': d['n'], 'rewards': list(d['rewards'])}
+                        for s, d in mob_bandit.items()
+                    }
+                    for mob, mob_bandit in self._strategy_bandit.items()
+                }
+                current = self._strategy_current
+                current_mob = self._strategy_block_mobility
+                cur_mobility = self._current_mobility
+                if self._strategy_block_start_mono is not None:
+                    eib_secs = int(time.monotonic() - self._strategy_block_start_mono)
+                else:
+                    eib_secs = 0
+                uniques_this_block = max(
+                    0, self._lifetime_new_count - self._uniques_at_block_start)
+            ret = ['<h2>🤖 Auto-strategy meta-bandit '
+                   '<small class="muted">(picks the strategy that captures '
+                   'the most unique HS in YOUR environment, '
+                   'separately for stationary and moving)</small></h2>']
+            ret.append(
+                f'<p class="muted">Current block: '
+                f'<b>{html.escape(str(current or "—"))}</b> '
+                f'@ <b>{html.escape(str(current_mob or "—"))}</b> '
+                f'(running {eib_secs}s of {block_unit}, '
+                f'{uniques_this_block} unique HS so far). '
+                f'Active mobility now: <b>{html.escape(cur_mobility)}</b></p>')
+
+            for mobility in (self.MOBILITY_STATIONARY, self.MOBILITY_MOVING):
+                mob_snap = snap.get(mobility, {})
+                # Find leader within this mobility
+                leaders = []
+                for s, d in mob_snap.items():
+                    rs = d['rewards']
+                    if rs:
+                        leaders.append((s, sum(rs)/len(rs), d['n']))
+                leaders.sort(key=lambda x: -x[1])
+                leader_name = leaders[0][0] if leaders else '—'
+                ret.append(
+                    f'<h3>📊 {html.escape(mobility.title())} '
+                    f'<small class="muted">'
+                    f'(leader: {html.escape(leader_name)})</small></h3>'
+                    '<table>'
+                    '<tr><th>Strategy</th><th>Status</th>'
+                    '<th>Blocks evaluated</th>'
+                    '<th>Mean reward</th>'
+                    '<th>Recent rewards</th></tr>')
+                for s in ('adaptive', 'full', 'capped'):
+                    d = mob_snap.get(s) or {'n': 0, 'rewards': []}
+                    rs = d['rewards']
+                    n = d['n']
+                    mean = (sum(rs) / len(rs)) if rs else 0.0
+                    recent_str = ' '.join(f'{r:.2f}' for r in rs[-8:]) or '—'
+                    badges = []
+                    if s == current and mobility == current_mob:
+                        badges.append('<span class="badge hot">RUNNING</span>')
+                    if s == leader_name and n > 0:
+                        badges.append('<span class="badge prior">★ LEADER</span>')
+                    if n == 0:
+                        badges.append('<span class="badge cold">untried</span>')
+                    status = ' '.join(badges) or '<span class="muted">queued</span>'
+                    ret.append(
+                        f'<tr><td><b>{html.escape(s)}</b></td>'
+                        f'<td>{status}</td>'
+                        f'<td>{n}</td>'
+                        f'<td>{mean:.3f}</td>'
+                        f'<td><small class="muted">'
+                        f'{html.escape(recent_str)}</small></td></tr>')
+                ret.append('</table>')
+            return ''.join(ret)
+        except Exception as e:
+            log.debug(f'[envtune] _ui_strategy_bandit: {e}')
+            return ''
 
     def _ui_summary_cards(self, current_zone_alias=None):
         """Big-KPI cards at the top of the dashboard. Each card answers
@@ -3926,6 +5902,33 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
              'EnvTune release version'),
             ('CPU profile',        self._profile_name,
              'Performance profile (auto-detected or manual)'),
+            ('Channel universe',
+             (f'{len(self._user_channels_orig)} channels '
+              f'<small class="muted">'
+              f'({"2.4 GHz" if all(c < 36 for c in self._user_channels_orig) else "2.4 + 5 GHz"})</small>'
+              if self._user_channels_orig else '<span class="muted">unknown</span>'),
+             'Channels envtune is allowed to scan, sourced from your '
+             'config.toml personality.channels (or iface_channels if empty).'),
+            ('Channel strategy',
+             (f'<b>{html.escape(self._resolve_channel_strategy())}</b>'),
+             'How envtune schedules scanning — adaptive (default), '
+             'full, or capped. See changelog for trade-offs.'),
+            ('Stability mode',
+             ('<span class="good">on (noai-aligned)</span>'
+              if self.cfg.get('prefer_stability', True)
+              else '<span class="warn">off (aggressive: proactive + overrides)</span>'),
+             'When on (default), envtune disables features that add '
+             'radio activity beyond pwnagotchi\'s natural loop. Aligns '
+             'with the noai branch\'s stability + battery-life goals.'),
+            ('Community priors',
+             (f'<span class="muted">'
+              f'{len(os.listdir(self.COMMUNITY_PRIORS_DIR))} file(s) in '
+              f'{self.COMMUNITY_PRIORS_DIR}</span>'
+              if os.path.isdir(self.COMMUNITY_PRIORS_DIR)
+              else f'<span class="muted">none — drop anon exports into '
+                   f'{self.COMMUNITY_PRIORS_DIR}/ to bootstrap learning</span>'),
+             'Community-shared anonymised exports merged at startup as '
+             'low-weight priors. Optional but speeds cold-start convergence.'),
             ('Epochs observed',    self.epochs_seen,
              'Epochs since plugin started'),
             ('🆕 UNIQUE lifetime',
@@ -3943,8 +5946,15 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
              'Distinct APs handshaked this session'),
             ('Pre-captured BSSIDs', len(self._captured_bssids),
              'BSSIDs already on disk (deprioritized)'),
-            ('Cracked (wpa-sec)',  len(self._cracked_bssids),
-             'BSSIDs with known password from wpa-sec potfile'),
+            ('Cracked (wpa-sec)',
+             (f'{len(self._cracked_bssids)}'
+              if self._cracked_bssids
+              else (f'<span class="muted">0 (potfile present, no cracks yet)</span>'
+                    if os.path.exists(self._wpasec_pot)
+                    else f'<span class="muted">not configured</span>')),
+             'BSSIDs with known password from wpa-sec potfile. '
+             'Optional — if you don\'t use wpa-sec, this stays empty. '
+             'No effect on capture rate.'),
             ('Whitelisted',
              f'{len(self._whitelist_macs)} MAC + {len(self._whitelist_ssids)} SSID',
              'Networks excluded from tracking'),
@@ -3952,13 +5962,22 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
              'In-memory AP intelligence cache'),
             ('Active channels',    self._active_channels,
              'Channels with currently visible APs'),
-            ('GPS source',         self._gps_source or 'none',
-             'How GPS data is being read'),
+            ('GPS source',
+             (html.escape(self._gps_source)
+              if self._gps_source
+              else f'<span class="muted">off (mobility via AP-turnover '
+                   f'heuristic)</span>'),
+             'How GPS data is being read. Optional — without GPS, mobility '
+             'is detected from AP turnover (less precise but still works).'),
             ('Current zone',       zone_display,
-             'GPS-derived zone (anonymised — raw key never shown)'),
+             'GPS-derived zone (anonymised — raw key never shown). '
+             'Empty if GPS is not configured.'),
             ('Battery',            (f'{self._battery_level:.0f}%'
-                                    if self._battery_level else 'n/a'),
-             'PiSugar battery level'),
+                                    if self._battery_level
+                                    else f'<span class="muted">not detected '
+                                         f'(no PiSugar / no UI element)</span>'),
+             'PiSugar battery level. Optional — without it, battery-aware '
+             'aggression scaling is skipped.'),
             ('EMA APs visible',    self._fmt(self.ema.get('aps'), '.1f'),
              'Smoothed AP count'),
             ('EMA HS rate',        self._fmt(self.ema.get('hs_rate')),
@@ -4060,16 +6079,33 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
             best_wn   = 0
             parts     = []
             tot_n     = 0
+            starved_promising = []   # (arm, n, mean) — n<5 but mean>=0.30
+            starvation_n = int(self.cfg.get('forced_explore_starvation_n', 5))
             for arm in arms:
                 rewards = arm_snap.get(arm, [])
                 wn      = len(rewards)
                 tot_n  += wn
                 mean    = (sum(rewards) / wn) if wn > 0 else 0.0
-                # Mark cells that are still on the seeded prior 0.30
-                # (n=1, single 0.30 sample) — UCB hasn't really learned
-                # this arm yet.
-                is_prior = (wn == 1 and abs(mean - 0.30) < 1e-6)
-                badge = ' <span class="badge prior" title="seeded prior — no real data yet">P</span>' if is_prior else ''
+                # Mark cells that are still on the seeded NEUTRAL prior
+                # (n=1, single PRIOR_NEUTRAL_R sample) — UCB hasn't
+                # really learned this arm yet.
+                is_prior = (wn == 1 and abs(mean - self.PRIOR_NEUTRAL_R) < 1e-6)
+                # v1.7: starved-but-promising arm — small n but mean
+                # above the neutral prior. Flagged so operators can see
+                # where forced-exploration is concentrating.
+                is_starved_good = (1 <= wn < starvation_n
+                                   and mean >= self.PRIOR_NEUTRAL_R
+                                   and not is_prior)
+                if is_prior:
+                    badge = (' <span class="badge prior" '
+                             'title="seeded prior — no real data yet">P</span>')
+                elif is_starved_good:
+                    badge = (' <span class="badge cold" '
+                             'title="under-explored but promising — '
+                             'forced-exploration will target this">★</span>')
+                    starved_promising.append((arm, wn, mean))
+                else:
+                    badge = ''
                 parts.append(f'{arm}({wn}:{mean:.2f}){badge}')
                 if wn > 0 and mean > best_mean:
                     best_mean, best_arm, best_wn = mean, arm, wn
@@ -4124,7 +6160,7 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                 '<small class="muted">(lifetime stats, sparklines = HS share)</small>'
                 '</h2><table>')
         ret += ('<tr><th>Ch</th><th>HS</th><th>HS share</th>'
-                '<th>Passive</th><th>Cracked</th>'
+                '<th>Passive</th>'
                 '<th>Assocs</th><th>Deauths</th><th>Clients</th>'
                 '<th>Visits</th><th>Eff</th><th>Wasted</th>'
                 '<th>Free</th><th>Dead<small>(sess/lt)</small></th>'
@@ -4155,7 +6191,6 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                     f'<td class="good"><b>{hs}</b></td>'
                     f'<td>{spark}</td>'
                     f'<td>{d.get("passive_hs", 0)}</td>'
-                    f'<td>{d.get("cracked", 0)}</td>'
                     f'<td>{d.get("assocs", 0)}</td>'
                     f'<td>{d.get("deauths", 0)}</td>'
                     f'<td>{d.get("clients", 0)}</td>'
@@ -4169,7 +6204,7 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                     f'/<span class="bad">{lt_dead}</span>'
                     f'</small></td>'
                     f'<td>{sc:.2f}</td></tr>')
-        ret += ('<tr><td colspan=14><small>'
+        ret += ('<tr><td colspan=13><small>'
                 '🔵 = non-overlapping (1/6/11 on 2.4GHz) · '
                 '✨ = bettercap reported free this session · '
                 'Dead = (session epochs absent / lifetime epochs absent)'
@@ -4401,31 +6436,59 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
             so the order is informative).
           - per-zone `last_seen` (unix timestamp)
             → `days_ago` float, rounded to 0.1 day.
-        Preserves: hs / attacks / visits / channels — the parts that
-        are actually useful when shared as community priors.
+
+        v1.8.1 — strips:
+          - captured_bssids: list of AP MAC addresses you've captured.
+            Privacy risk because BSSIDs are publicly geolocatable via
+            WiGLE (https://wigle.net), so sharing your captured set
+            reveals approximate locations you've been. Useless to other
+            users anyway (their environment has different APs).
+          - cracked_bssids: same as above, plus reveals which APs you
+            have the password for — sensitive info.
+          - ema.speed: GPS-derived speed; reveals mobility patterns.
+            Replaced with redacted marker if non-null.
+
+        Preserves: hs / attacks / visits / channels per zone — the parts
+        that are actually useful when shared as community priors.
+        Preserves: ucb_table — the parameter learning, no location data.
 
         Operates on a deep-ish copy so the live snapshot isn't mutated.
         """
-        import copy
         out = copy.deepcopy(data)
-        zones_in = out.get('gps_zones') or {}
-        if not zones_in:
-            return out
 
-        # Sort: zones with most HS first → zone_001 is the "best" zone.
-        ranked = sorted(
-            zones_in.items(),
-            key=lambda kv: -(kv[1].get('hs', 0) or 0))
-        now = time.time()
-        anon = {}
-        for idx, (_real_key, zd) in enumerate(ranked, start=1):
-            ls = _sf(zd.get('last_seen', 0)) or 0.0
-            days_ago = round(max(0.0, (now - ls) / 86400.0), 1) if ls else None
-            zd_anon = dict(zd)
-            zd_anon.pop('last_seen', None)
-            zd_anon['days_ago'] = days_ago
-            anon[f'zone_{idx:03d}'] = zd_anon
-        out['gps_zones'] = anon
+        # Strip BSSID lists — they geolocate via WiGLE
+        out['captured_bssids'] = []
+        out['cracked_bssids']  = []
+        # Replace with counts so the receiver knows roughly how seasoned
+        # the contributing operator is, without leaking individual MACs.
+        cap_n = len(data.get('captured_bssids') or [])
+        crk_n = len(data.get('cracked_bssids')  or [])
+        out['_captured_count'] = cap_n
+        out['_cracked_count']  = crk_n
+
+        # Redact GPS-derived speed if present
+        ema = out.get('ema') or {}
+        if ema.get('speed') is not None:
+            ema['speed'] = None
+            out['ema'] = ema
+
+        # GPS zones: anonymise keys + last_seen
+        zones_in = data.get('gps_zones') or {}
+        if zones_in:
+            ranked = sorted(
+                zones_in.items(),
+                key=lambda kv: -(kv[1].get('hs', 0) or 0))
+            now = time.time()
+            anon = {}
+            for idx, (_real_key, zd) in enumerate(ranked, start=1):
+                ls = _sf(zd.get('last_seen', 0)) or 0.0
+                days_ago = round(max(0.0, (now - ls) / 86400.0), 1) if ls else None
+                zd_anon = dict(zd)
+                zd_anon.pop('last_seen', None)
+                zd_anon['days_ago'] = days_ago
+                anon[f'zone_{idx:03d}'] = zd_anon
+            out['gps_zones'] = anon
+
         out['_export_mode'] = 'anonymised'
         return out
 
@@ -4443,9 +6506,21 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
 
         FULL (`/export?full=1`): unchanged raw state, including raw zone
         keys. Use this for your own backup; do NOT share it publicly.
+
+        v2.0 (R-01): serves a CACHED snapshot (refreshed by the save
+        worker thread). Stale by at most save_every_n epochs (~1-5 min).
+        Operators wanting freshness can hit POST /force-save first.
         """
         try:
-            data = self._build_state_snapshot()
+            # Use the cached snapshot if available; only build fresh on
+            # cold-start before any save has fired.
+            data = self._cached_snapshot
+            if data is None:
+                data = self._build_state_snapshot()
+            else:
+                # The cache is shared with the save worker — operate
+                # on a copy so anonymisation can't mutate it.
+                data = copy.deepcopy(data)
 
             # Detect the optional ?full=1 escape hatch. Default = anon.
             want_full = False
@@ -4504,6 +6579,21 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                 session_mono  = self.session_start_mono
                 whitelist     = len(self._whitelist_macs) + len(self._whitelist_ssids)
                 save_q        = self._save_queue.qsize() if hasattr(self, '_save_queue') else 0
+                # v2.0 (F-07, P-11): strategy bandit + error counters
+                strat_snap = {
+                    mob: {
+                        s: {'n': d['n'],
+                            'mean': (sum(d['rewards']) / len(d['rewards']))
+                                     if d['rewards'] else 0.0}
+                        for s, d in mob_bandit.items()
+                    }
+                    for mob, mob_bandit in self._strategy_bandit.items()
+                }
+                strat_cur = self._strategy_current or 'none'
+                strat_mob = self._strategy_block_mobility or 'none'
+                cur_block_uniques = max(
+                    0, self._lifetime_new_count - self._uniques_at_block_start)
+                error_snap = dict(self._error_counts)
             uptime_s = max(0.0, time.monotonic() - session_mono)
             lines = [
                 '# HELP envtune_lifetime_handshakes Total HS captured ever (incl dups)',
@@ -4585,6 +6675,28 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                 '# TYPE envtune_uptime_seconds counter',
                 f'envtune_uptime_seconds {uptime_s:.1f}',
             ]
+            # v2.0 (F-07): strategy bandit metrics — per (mobility, strategy)
+            lines.append('# HELP envtune_strategy_blocks Blocks evaluated for (mobility,strategy)')
+            lines.append('# TYPE envtune_strategy_blocks counter')
+            lines.append('# HELP envtune_strategy_mean_reward Mean reward over recent blocks for (mobility,strategy)')
+            lines.append('# TYPE envtune_strategy_mean_reward gauge')
+            for mob, mob_d in strat_snap.items():
+                for s, vals in mob_d.items():
+                    lab = f'{{mobility="{mob}",strategy="{s}"}}'
+                    lines.append(f'envtune_strategy_blocks{lab} {vals["n"]}')
+                    lines.append(f'envtune_strategy_mean_reward{lab} {vals["mean"]:.4f}')
+            lines.append('# HELP envtune_strategy_current_block_uniques Unique HS captured so far in the in-progress strategy block')
+            lines.append('# TYPE envtune_strategy_current_block_uniques gauge')
+            lines.append(f'envtune_strategy_current_block_uniques {cur_block_uniques}')
+            lines.append('# HELP envtune_strategy_active_strategy Strategy currently running (label only)')
+            lines.append('# TYPE envtune_strategy_active_strategy gauge')
+            lines.append(f'envtune_strategy_active_strategy{{strategy="{strat_cur}",mobility="{strat_mob}"}} 1')
+            # v2.0 (P-11): exception counter — operators can detect if a
+            # specific handler is consistently failing.
+            lines.append('# HELP envtune_exception_count Exceptions caught per handler (cumulative this session)')
+            lines.append('# TYPE envtune_exception_count counter')
+            for handler, cnt in sorted(error_snap.items()):
+                lines.append(f'envtune_exception_count{{handler="{handler}"}} {cnt}')
             resp = make_response('\n'.join(lines) + '\n', 200)
             resp.headers['Content-Type'] = 'text/plain; version=0.0.4; charset=utf-8'
             resp.headers['Cache-Control'] = 'no-store'
@@ -4743,16 +6855,18 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                 cracked = self._scan_cracked_potfile()
                 with self._state_lock:
                     added = len(cracked - self._cracked_bssids)
-                    self._cracked_bssids = cracked
+                    # v1.8.1: MERGE not REPLACE — keep prior cracks if
+                    # the live potfile got rotated between sessions.
+                    self._cracked_bssids |= cracked
                     # Mark already-known APs as cracked so the targeting loop
                     # picks the change up immediately.
                     for k, ap in self._known_aps.items():
-                        if self._mac_norm(ap.get('mac', '')) in cracked:
+                        if self._mac_norm(ap.get('mac', '')) in self._cracked_bssids:
                             ap['AT_cracked'] = True
                 self._enqueue_save(reason='potfile-rescan')
                 return self._post_redirect(
                     'rescan-potfile', True,
-                    f'Potfile rescanned — {len(cracked)} cracked '
+                    f'Potfile rescanned — {len(self._cracked_bssids)} cracked '
                     f'BSSIDs ({added} new).')
             if path == 'reset-stagnation':
                 with self._state_lock:
@@ -4787,7 +6901,7 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                     'clear-blind', True,
                     f'Blind-panic cleared (was {prior}).')
         except Exception as e:
-            logging.exception(f'[envtune] POST {path}: {e}')
+            log.exception(f'[envtune] POST {path}: {e}')
             return self._post_redirect(path, False, repr(e), status=500)
         return self._html_response(
             '<!DOCTYPE html><html><body><h1>404</h1>'
