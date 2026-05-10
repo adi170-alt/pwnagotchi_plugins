@@ -1,14 +1,34 @@
-    #!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 envtune.py  —  Adaptive Environment Tuner for Pwnagotchi
 =========================================================
-Version   : 2.2.0
+Version   : 2.2.1
 License   : MIT
 Repository: https://github.com/adi170-alt/envtune
 
+Changelog 2.2.0 → 2.2.1  (UI hotfix)
+────────────────────────────────────
+ • Fixed the `(block N/5)` display in the dashboard subtitle. v2.2.0
+   defaulted `auto_strategy_block_epochs = 0` (so the seconds-based
+   timer is used) but the inline strategy indicator was still reading
+   the epoch counter, producing nonsense like `block 10/5` once eib
+   exceeded the fallback default of 5. The actual block-end logic was
+   already correct (it's the dedicated `_ui_strategy_bandit` panel
+   that displays the real progress in seconds). The subtitle now
+   matches: shows `block Ns/1800s` in seconds-based mode, or
+   `block N/Mep` if the user explicitly set the legacy epoch mode.
+   No behaviour change — just a display fix.
+
 Changelog 2.1.0 → 2.2.0  (NOAI-ALIGNED: stability + battery first)
 ──────────────────────────────────────────────────────────────────
+Reminder from the upstream noai README:
+
+   "The 'old' Pwnagotchi used to have AI to help it learn from its
+   environment, but since then AI seemed to destabilize the Wi-Fi
+   firmware. So I have chosen to remove the AI completely to give
+   the Pwnagotchi more up-time and longer battery life when taking
+   it on a walk."  — jayofelony
 
 v2.2 audits every operation envtune performs against natural
 pwnagotchi radio behaviour, and DEFAULTS conservative wherever we'd
@@ -86,7 +106,7 @@ OBSERVABILITY
    the operator gets a WARNING — usually means the fork uses an
    unexpected filename convention.
 
-Changelog 1.9.0 → 2.0.0 
+Changelog 1.9.0 → 2.0.0  (PRODUCTION RELEASE)
 ─────────────────────────────────────────────
 v2.0 is the production-ready, "no-tuning-needed" release. It consolidates
 every correctness fix, hardens robustness for bare-bones setups, adds the
@@ -490,7 +510,8 @@ Built on top of prior art by:
   • @evilsocket   — original pwnagotchi
   • @jayofelony   — noai fork
   • @Sniffleupagus — auto_tune plugin
-  • @AlienMajik — TheyLive GPS plugin
+  • @rai68 + @AlienMajik — TheyLive GPS plugin
+  • @adi1708(⌐■_■)        — earlier envtune iterations
 """
 
 import copy
@@ -688,7 +709,7 @@ HW_DEFAULT_PROFILE = {
 
 class EnvTune(plugins.Plugin):
     __author__      = 'adi1708'
-    __version__     = '2.2.0'
+    __version__     = '2.2.1'
     __license__     = 'MIT'
     __description__ = ('Adaptive environment tuner — drop-in replacement '
                        'for the removed pwnagotchi AI. Learns optimal '
@@ -5565,16 +5586,38 @@ ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
                 'channel_full_sweep_every', 15)))
 
             if cfg_mode == 'auto':
-                block_size = max(5, int(self.cfg.get(
-                    'auto_strategy_block_epochs', 30)))
-                eib = max(0, self.epochs_seen - self._strategy_block_start_ep)
-                left = max(0, block_size - eib)
+                # v2.2.1: respect whichever block-size mode is active.
+                # epochs_legacy > 0 means the user explicitly opted into
+                # the legacy v1.9 epoch-counter mode; otherwise we use
+                # the v2.0+ seconds-based block timer (matching the
+                # actual block-end check in `_strategy_block_size_check`).
+                epochs_legacy = int(self.cfg.get(
+                    'auto_strategy_block_epochs', 0) or 0)
+                if epochs_legacy > 0:
+                    block_size = max(5, epochs_legacy)
+                    if self._strategy_block_start_ep is not None:
+                        eib = max(0, self.epochs_seen
+                                  - self._strategy_block_start_ep)
+                    else:
+                        eib = 0
+                    progress = f'block {eib}/{block_size}ep'
+                    tip_unit  = f'{block_size}-epoch blocks'
+                else:
+                    block_size = max(60, int(self.cfg.get(
+                        'auto_strategy_block_secs', 1800)))
+                    if self._strategy_block_start_mono is not None:
+                        eib = max(0, int(time.monotonic()
+                                         - self._strategy_block_start_mono))
+                    else:
+                        eib = 0
+                    progress = f'block {eib}s/{block_size}s'
+                    tip_unit  = f'{block_size}-second blocks'
                 tip = (f'auto: meta-bandit cycles through adaptive/full/capped '
-                       f'in {block_size}-epoch blocks, picks the strategy that '
+                       f'in {tip_unit}, picks the strategy that '
                        f'captures the most unique HS in YOUR environment')
                 return (f'<span title="{html.escape(tip)}">'
                         f'channels=<b>auto→{html.escape(active)}</b> '
-                        f'<small>(block {eib}/{block_size})</small></span> | ')
+                        f'<small>({progress})</small></span> | ')
             if active == 'adaptive':
                 next_sweep = max(0, sweep_every -
                                  (self.epochs_seen - self._last_full_sweep_ep))
